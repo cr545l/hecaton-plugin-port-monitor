@@ -166,6 +166,13 @@ async function refreshProcessCache() {
   }
 }
 
+function splitAddr(addr) {
+  if (!addr) return ['*', '*'];
+  const lastColon = addr.lastIndexOf(':');
+  if (lastColon === -1) return [addr, '*'];
+  return [addr.substring(0, lastColon), addr.substring(lastColon + 1)];
+}
+
 async function collectPortData() {
   if (collecting) return;
   collecting = true;
@@ -206,7 +213,9 @@ async function collectPortData() {
       }
 
       const processName = processCache.get(pid) || '';
-      entries.push({ proto, localAddr, remoteAddr, state, pid, processName });
+      const [localIp, localPort] = splitAddr(localAddr);
+      const [remoteIp, remotePort] = splitAddr(remoteAddr);
+      entries.push({ proto, localIp, localPort, remoteIp, remotePort, state, pid, processName });
     }
     portEntries = entries;
     lastUpdated = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -242,8 +251,10 @@ function applyFilterAndSort() {
     const q = searchQuery.toLowerCase();
     entries = entries.filter(e =>
       e.proto.toLowerCase().includes(q) ||
-      e.localAddr.toLowerCase().includes(q) ||
-      e.remoteAddr.toLowerCase().includes(q) ||
+      e.localIp.toLowerCase().includes(q) ||
+      e.localPort.includes(q) ||
+      e.remoteIp.toLowerCase().includes(q) ||
+      e.remotePort.includes(q) ||
       e.state.toLowerCase().includes(q) ||
       e.pid.includes(q) ||
       e.processName.toLowerCase().includes(q)
@@ -254,14 +265,18 @@ function applyFilterAndSort() {
   entries.sort((a, b) => {
     let va, vb;
     switch (sortColumn) {
-      case 'proto':     va = a.proto;       vb = b.proto; break;
-      case 'local':     va = a.localAddr;   vb = b.localAddr; break;
-      case 'remote':    va = a.remoteAddr;  vb = b.remoteAddr; break;
-      case 'state':     va = a.state;       vb = b.state; break;
-      case 'pid':       va = parseInt(a.pid) || 0; vb = parseInt(b.pid) || 0;
-                        return sortAsc ? va - vb : vb - va;
-      case 'process':   va = a.processName; vb = b.processName; break;
-      default:          va = a.proto;       vb = b.proto; break;
+      case 'proto':      va = a.proto;       vb = b.proto; break;
+      case 'localIp':    va = a.localIp;     vb = b.localIp; break;
+      case 'localPort':  va = parseInt(a.localPort) || 0; vb = parseInt(b.localPort) || 0;
+                         return sortAsc ? va - vb : vb - va;
+      case 'remoteIp':   va = a.remoteIp;    vb = b.remoteIp; break;
+      case 'remotePort': va = parseInt(a.remotePort) || 0; vb = parseInt(b.remotePort) || 0;
+                         return sortAsc ? va - vb : vb - va;
+      case 'state':      va = a.state;       vb = b.state; break;
+      case 'pid':        va = parseInt(a.pid) || 0; vb = parseInt(b.pid) || 0;
+                         return sortAsc ? va - vb : vb - va;
+      case 'process':    va = a.processName; vb = b.processName; break;
+      default:           va = a.proto;       vb = b.proto; break;
     }
     if (typeof va === 'string') {
       const cmp = va.localeCompare(vb);
@@ -445,8 +460,10 @@ function render() {
   };
   let headerLine = ' ';
   headerLine += pad(ansi.bold + ansi.fg.white + 'PROTO' + sortIndicator('proto') + ansi.reset, COL.proto);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'LOCAL ADDRESS' + sortIndicator('local') + ansi.reset, COL.local);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'REMOTE ADDRESS' + sortIndicator('remote') + ansi.reset, COL.remote);
+  headerLine += pad(ansi.bold + ansi.fg.white + 'LOCAL IP' + sortIndicator('localIp') + ansi.reset, COL.localIp);
+  headerLine += pad(ansi.bold + ansi.fg.white + 'PORT' + sortIndicator('localPort') + ansi.reset, COL.localPort);
+  headerLine += pad(ansi.bold + ansi.fg.white + 'REMOTE IP' + sortIndicator('remoteIp') + ansi.reset, COL.remoteIp);
+  headerLine += pad(ansi.bold + ansi.fg.white + 'PORT' + sortIndicator('remotePort') + ansi.reset, COL.remotePort);
   headerLine += pad(ansi.bold + ansi.fg.white + 'STATE' + sortIndicator('state') + ansi.reset, COL.state);
   headerLine += pad(ansi.bold + ansi.fg.white + 'PID' + sortIndicator('pid') + ansi.reset, COL.pid);
   headerLine += ansi.bold + ansi.fg.white + 'PROCESS' + sortIndicator('process') + ansi.reset;
@@ -484,14 +501,15 @@ function render() {
     const isSelected = idx === selectedIndex;
     const stateColor = getStateColor(entry.state);
 
-    const processMaxLen = Math.max(1, w - COL.proto - COL.local - COL.remote - COL.state - COL.pid - 2);
+    const processMaxLen = Math.max(1, w - COL.proto - COL.localIp - COL.localPort - COL.remoteIp - COL.remotePort - COL.state - COL.pid - 2);
     let line;
     if (isSelected) {
-      // No intermediate resets — inverse stays active across the entire line
       line = ansi.inverse + ' ' +
         pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1), COL.proto) +
-        pad(ansi.fg.cyan + truncate(entry.localAddr, COL.local - 1), COL.local) +
-        pad(ansi.fg.white + truncate(entry.remoteAddr, COL.remote - 1), COL.remote) +
+        pad(ansi.fg.cyan + truncate(entry.localIp, COL.localIp - 1), COL.localIp) +
+        pad(ansi.fg.cyan + truncate(entry.localPort, COL.localPort - 1), COL.localPort) +
+        pad(ansi.fg.white + truncate(entry.remoteIp, COL.remoteIp - 1), COL.remoteIp) +
+        pad(ansi.fg.white + truncate(entry.remotePort, COL.remotePort - 1), COL.remotePort) +
         pad(stateColor + truncate(entry.state, COL.state - 1), COL.state) +
         pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1), COL.pid) +
         ansi.fg.magenta + truncate(entry.processName, processMaxLen) +
@@ -499,8 +517,10 @@ function render() {
     } else {
       line = ' ' +
         pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1) + ansi.reset, COL.proto) +
-        pad(ansi.fg.cyan + truncate(entry.localAddr, COL.local - 1) + ansi.reset, COL.local) +
-        pad(ansi.dim + truncate(entry.remoteAddr, COL.remote - 1) + ansi.reset, COL.remote) +
+        pad(ansi.fg.cyan + truncate(entry.localIp, COL.localIp - 1) + ansi.reset, COL.localIp) +
+        pad(ansi.fg.cyan + truncate(entry.localPort, COL.localPort - 1) + ansi.reset, COL.localPort) +
+        pad(ansi.dim + truncate(entry.remoteIp, COL.remoteIp - 1) + ansi.reset, COL.remoteIp) +
+        pad(ansi.dim + truncate(entry.remotePort, COL.remotePort - 1) + ansi.reset, COL.remotePort) +
         pad(stateColor + truncate(entry.state, COL.state - 1) + ansi.reset, COL.state) +
         pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1) + ansi.reset, COL.pid) +
         ansi.fg.magenta + truncate(entry.processName, processMaxLen) + ansi.reset;
@@ -531,33 +551,37 @@ function render() {
 }
 
 function computeColumns(totalWidth) {
-  // Minimum columns with padding
-  const proto = 8;
+  const proto = 7;
+  const localPort = 8;
+  const remotePort = 8;
   const pid = 8;
-  const state = 15;
-  const remaining = totalWidth - proto - pid - state - 2; // 2 for leading spaces
-  const local = Math.max(16, Math.floor(remaining * 0.38));
-  const remote = Math.max(16, Math.floor(remaining * 0.38));
+  const state = 14;
+  const fixed = proto + localPort + remotePort + pid + state + 2;
+  const remaining = Math.max(0, totalWidth - fixed);
+  const localIp = Math.max(16, Math.floor(remaining * 0.25));
+  const remoteIp = Math.max(16, Math.floor(remaining * 0.25));
   // process gets the rest
-  return { proto, local, remote, state, pid };
+  return { proto, localIp, localPort, remoteIp, remotePort, state, pid };
 }
 
 function getColumnAtX(cx) {
   const COL = computeColumns(termCols);
-  let x = 2; // 1-based column, after leading space
+  let x = 2;
   const cols = [
-    { name: 'proto',   w: COL.proto },
-    { name: 'local',   w: COL.local },
-    { name: 'remote',  w: COL.remote },
-    { name: 'state',   w: COL.state },
-    { name: 'pid',     w: COL.pid },
-    { name: 'process', w: termCols - x - COL.proto - COL.local - COL.remote - COL.state - COL.pid + 1 },
+    { name: 'proto',      w: COL.proto },
+    { name: 'localIp',    w: COL.localIp },
+    { name: 'localPort',  w: COL.localPort },
+    { name: 'remoteIp',   w: COL.remoteIp },
+    { name: 'remotePort', w: COL.remotePort },
+    { name: 'state',      w: COL.state },
+    { name: 'pid',        w: COL.pid },
+    { name: 'process',    w: 999 },
   ];
   for (const col of cols) {
     if (cx >= x && cx < x + col.w) return col.name;
     x += col.w;
   }
-  return 'process'; // fallback for rightmost area
+  return 'process';
 }
 
 function toggleSort(col) {
@@ -586,12 +610,14 @@ function getMenuZone(row) {
 function getMenuItems(zone) {
   if (zone === 'colheader') {
     return [
-      { id: 'sort_proto',   label: 'Sort by Protocol' + (sortColumn === 'proto' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_local',   label: 'Sort by Local Address' + (sortColumn === 'local' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_remote',  label: 'Sort by Remote Address' + (sortColumn === 'remote' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_state',   label: 'Sort by State' + (sortColumn === 'state' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_pid',     label: 'Sort by PID' + (sortColumn === 'pid' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_process', label: 'Sort by Process' + (sortColumn === 'process' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_proto',      label: 'Sort by Protocol' + (sortColumn === 'proto' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_localIp',    label: 'Sort by Local IP' + (sortColumn === 'localIp' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_localPort',  label: 'Sort by Local Port' + (sortColumn === 'localPort' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_remoteIp',   label: 'Sort by Remote IP' + (sortColumn === 'remoteIp' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_remotePort', label: 'Sort by Remote Port' + (sortColumn === 'remotePort' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_state',      label: 'Sort by State' + (sortColumn === 'state' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_pid',        label: 'Sort by PID' + (sortColumn === 'pid' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_process',    label: 'Sort by Process' + (sortColumn === 'process' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
       { type: 'separator' },
       { id: 'filter_state', label: 'State Filter', icon: 'filter', children:
         STATES.map(s => ({
@@ -621,11 +647,11 @@ function getMenuItems(zone) {
       const pidLabel = entry.processName
         ? `Kill ${entry.processName} (PID ${entry.pid})`
         : `Kill PID ${entry.pid}`;
-      items.push({ id: 'kill', label: pidLabel, icon: 'close' });
+      items.push({ id: 'kill', label: pidLabel, icon: 'close', color: '#E06C75' });
       items.push({ type: 'separator' });
       items.push({ id: 'copy_line', label: 'Copy Line', icon: 'clippy', shortcut: 'c' });
-      items.push({ id: 'copy_port', label: `Copy Port (${extractPort(entry.localAddr)})`, icon: 'clippy' });
-      items.push({ id: 'copy_addr', label: `Copy Address (${entry.localAddr})`, icon: 'clippy' });
+      items.push({ id: 'copy_port', label: `Copy Port (${entry.localPort})`, icon: 'clippy' });
+      items.push({ id: 'copy_addr', label: `Copy Address (${entry.localIp}:${entry.localPort})`, icon: 'clippy' });
     }
     items.push({ type: 'separator' });
     items.push({ id: 'refresh', label: 'Refresh', icon: 'refresh', shortcut: 'r' });
@@ -634,12 +660,6 @@ function getMenuItems(zone) {
   return [];
 }
 
-function extractPort(addr) {
-  if (!addr) return '';
-  const lastColon = addr.lastIndexOf(':');
-  if (lastColon === -1) return addr;
-  return addr.substring(lastColon + 1);
-}
 
 function updateMenuForZone(zone) {
   if (zone === currentMenuZone) return;
@@ -1043,7 +1063,7 @@ async function killSelectedProcess() {
   await sendRpc('show_dialog', {
     type: 'message',
     title: 'Kill Process',
-    message: `Terminate ${name} (PID ${entry.pid})?\n\nLocal: ${entry.localAddr}\nRemote: ${entry.remoteAddr}\nState: ${entry.state || 'N/A'}`,
+    message: `Terminate ${name} (PID ${entry.pid})?\n\nLocal: ${entry.localIp}:${entry.localPort}\nRemote: ${entry.remoteIp}:${entry.remotePort}\nState: ${entry.state || 'N/A'}`,
     buttons: [
       { id: 'kill_confirm', label: 'Kill' },
       { id: 'cancel', label: 'Cancel' },
@@ -1054,21 +1074,20 @@ async function killSelectedProcess() {
 async function copySelectedLine() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  const line = `${entry.proto}\t${entry.localAddr}\t${entry.remoteAddr}\t${entry.state}\t${entry.pid}\t${entry.processName}`;
+  const line = `${entry.proto}\t${entry.localIp}\t${entry.localPort}\t${entry.remoteIp}\t${entry.remotePort}\t${entry.state}\t${entry.pid}\t${entry.processName}`;
   await sendRpc('write_clipboard', { text: line });
 }
 
 async function copySelectedPort() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  const port = extractPort(entry.localAddr);
-  await sendRpc('write_clipboard', { text: port });
+  await sendRpc('write_clipboard', { text: entry.localPort });
 }
 
 async function copySelectedAddr() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  await sendRpc('write_clipboard', { text: entry.localAddr });
+  await sendRpc('write_clipboard', { text: entry.localIp + ':' + entry.localPort });
 }
 
 function toggleAutoRefresh() {
