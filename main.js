@@ -542,6 +542,36 @@ function computeColumns(totalWidth) {
   return { proto, local, remote, state, pid };
 }
 
+function getColumnAtX(cx) {
+  const COL = computeColumns(termCols);
+  let x = 2; // 1-based column, after leading space
+  const cols = [
+    { name: 'proto',   w: COL.proto },
+    { name: 'local',   w: COL.local },
+    { name: 'remote',  w: COL.remote },
+    { name: 'state',   w: COL.state },
+    { name: 'pid',     w: COL.pid },
+    { name: 'process', w: termCols - x - COL.proto - COL.local - COL.remote - COL.state - COL.pid + 1 },
+  ];
+  for (const col of cols) {
+    if (cx >= x && cx < x + col.w) return col.name;
+    x += col.w;
+  }
+  return 'process'; // fallback for rightmost area
+}
+
+function toggleSort(col) {
+  if (sortColumn === col) {
+    sortAsc = !sortAsc;
+  } else {
+    sortColumn = col;
+    sortAsc = true;
+  }
+  applyFilterAndSort();
+  refreshContextMenu();
+  rerender();
+}
+
 // ============================================================
 // 7. Context Menu
 // ============================================================
@@ -648,16 +678,7 @@ async function handleMenuAction(actionId) {
   }
   // Sort actions
   if (actionId.startsWith('sort_')) {
-    const col = actionId.substring(5);
-    if (sortColumn === col) {
-      sortAsc = !sortAsc;
-    } else {
-      sortColumn = col;
-      sortAsc = true;
-    }
-    applyFilterAndSort();
-    refreshContextMenu();
-    rerender();
+    toggleSort(actionId.substring(5));
     return;
   }
 
@@ -802,6 +823,12 @@ function handleInput(data) {
         if (selectedIndex >= scrollOffset + dataRows) selectedIndex = scrollOffset + dataRows - 1;
         if (selectedIndex >= filteredEntries.length) selectedIndex = filteredEntries.length - 1;
         rerender();
+        return;
+      }
+
+      // Column header click → sort
+      if (cy === 1 && btn === 0) {
+        toggleSort(getColumnAtX(cx));
         return;
       }
 
