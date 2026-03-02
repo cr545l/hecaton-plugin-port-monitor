@@ -1,0 +1,21 @@
+{
+  "id": "port-monitor",
+  "name": "Port Monitor",
+  "version": "1.0.0",
+  "entry": "main.js",
+  "runtime": "node",
+  "apiVersion": { "major": 1, "minor": 0 },
+  "overlay": {
+    "mode": "floating",
+    "width": "80%",
+    "height": "75%",
+    "z_order": 50,
+    "minimizable": true,
+    "maximizable": true,
+    "resizable": true,
+    "bordered": true,
+    "minimized_label": "Ports",
+    "minimized_label_color": "#E06C75",
+    "precise_mouse": false
+  }
+}
