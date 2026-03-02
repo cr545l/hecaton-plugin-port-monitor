@@ -91,6 +91,16 @@ const PROCESS_CACHE_TTL = 10000;
 // Data collection state
 let collecting = false;
 let lastUpdated = '';
+let loadingTimer = null;
+
+// Cell size for sixel scrollbar
+let cellW = 8;
+let cellH = 16;
+
+// Scrollbar state
+let scrollbarOverlay = null;  // { sixelStr, screenRow, screenCol, viewportRows, maxScroll }
+let dragging = null;          // 'scrollbar' | null
+let scrollbarDragInfo = null; // { trackTop, trackH, maxScroll }
 
 // ============================================================
 // 3. RPC Helpers
@@ -121,13 +131,21 @@ function handleRpcResponse(json) {
 // ============================================================
 // 4. Data Collection
 // ============================================================
-const { execSync } = require('child_process');
+const { exec, execSync } = require('child_process');
 
-function refreshProcessCache() {
+function execAsync(cmd, opts) {
+  return new Promise((resolve) => {
+    exec(cmd, opts, (err, stdout) => {
+      resolve(err ? '' : stdout);
+    });
+  });
+}
+
+async function refreshProcessCache() {
   const now = Date.now();
   if (now - processCacheTime < PROCESS_CACHE_TTL && processCache.size > 0) return;
   try {
-    const out = execSync('tasklist /FO CSV /NH', {
+    const out = await execAsync('tasklist /FO CSV /NH', {
       encoding: 'utf-8',
       timeout: 5000,
       windowsHide: true,
@@ -136,7 +154,6 @@ function refreshProcessCache() {
     for (const line of out.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      // Format: "name.exe","PID","Session Name","Session#","Mem Usage"
       const match = trimmed.match(/^"([^"]+)","(\d+)"/);
       if (match) {
         newCache.set(match[2], match[1]);
@@ -149,22 +166,23 @@ function refreshProcessCache() {
   }
 }
 
-function collectPortData() {
+async function collectPortData() {
   if (collecting) return;
   collecting = true;
+  // Animate spinner while loading (only when data is empty)
+  if (filteredEntries.length === 0) {
+    loadingTimer = setInterval(() => rerender(), 120);
+    rerender();
+  }
   try {
-    refreshProcessCache();
-    const out = execSync('netstat -ano', {
-      encoding: 'utf-8',
-      timeout: 10000,
-      windowsHide: true,
-    });
+    const [netstatOut] = await Promise.all([
+      execAsync('netstat -ano', { encoding: 'utf-8', timeout: 10000, windowsHide: true }),
+      refreshProcessCache(),
+    ]);
     const entries = [];
-    for (const line of out.split('\n')) {
+    for (const line of netstatOut.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      // TCP/UDP lines: Proto  LocalAddress  ForeignAddress  State  PID
-      // UDP lines may not have state: Proto  LocalAddress  *:*  PID
       const parts = trimmed.split(/\s+/);
       if (parts.length < 4) continue;
       const proto = parts[0].toUpperCase();
@@ -176,7 +194,6 @@ function collectPortData() {
         remoteAddr = parts[2] || '*:*';
         state = '';
         pid = parts[3] || parts[2];
-        // If remoteAddr looks like a PID (all digits), shift
         if (/^\d+$/.test(remoteAddr)) {
           pid = remoteAddr;
           remoteAddr = '*:*';
@@ -198,6 +215,8 @@ function collectPortData() {
     // keep old data on error
   }
   collecting = false;
+  if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
+  rerender();
 }
 
 // ============================================================
@@ -260,23 +279,35 @@ function applyFilterAndSort() {
   clampScroll();
 }
 
+function getMaxScroll() {
+  return Math.max(0, filteredEntries.length - getDataRowCount());
+}
+
 function clampScroll() {
   const dataRows = getDataRowCount();
-  if (filteredEntries.length <= dataRows) {
+  const maxScroll = getMaxScroll();
+
+  // Clamp selectedIndex first
+  if (filteredEntries.length === 0) {
+    selectedIndex = 0;
     scrollOffset = 0;
-  } else {
-    const maxScroll = filteredEntries.length - dataRows;
-    if (scrollOffset > maxScroll) scrollOffset = maxScroll;
-    if (scrollOffset < 0) scrollOffset = 0;
+    return;
   }
+  if (selectedIndex < 0) selectedIndex = 0;
+  if (selectedIndex >= filteredEntries.length) selectedIndex = filteredEntries.length - 1;
+
+  // Clamp scrollOffset
+  if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+  if (scrollOffset < 0) scrollOffset = 0;
+
   // Ensure selected is visible
   if (selectedIndex < scrollOffset) scrollOffset = selectedIndex;
   if (selectedIndex >= scrollOffset + dataRows) scrollOffset = selectedIndex - dataRows + 1;
 }
 
 function getDataRowCount() {
-  // Rows: 1=title, 2=filter, 3=sep, 4=colheader, 5=sep, ..., last=statusbar
-  return Math.max(1, termRows - 6);
+  // Rows: 1=colheader, 2=sep
+  return Math.max(1, termRows - 2);
 }
 
 // ============================================================
@@ -327,6 +358,79 @@ function truncate(str, maxLen) {
   return str.substring(0, maxLen - 1) + '\u2026';
 }
 
+// ---- Sixel Scrollbar ----
+const SCROLLBAR_PALETTE = [[100, 110, 130]];
+const SCROLLBAR_ACTIVE_PALETTE = [[210, 225, 245]];
+
+function renderScrollbarPixels(cW, cH, viewportRows, offset, maxScroll) {
+  if (maxScroll <= 0) return null;
+  const w = cW;
+  const trackH = viewportRows * cH;
+  if (w <= 0 || trackH <= 0) return null;
+  const totalItems = viewportRows + maxScroll;
+  const handleH = Math.max(cH, Math.floor(trackH * viewportRows / totalItems));
+  const handleY = Math.floor((trackH - handleH) * offset / maxScroll);
+  const buf = new Uint8Array(w * trackH);
+  const padX = 2;
+  const roundY = 1;
+  for (let y = handleY; y < handleY + handleH && y < trackH; y++) {
+    const dy = y - handleY;
+    const dyEnd = handleY + handleH - 1 - y;
+    for (let x = padX; x < w - padX; x++) {
+      if (dy < roundY && (x === padX || x === w - padX - 1)) continue;
+      if (dyEnd < roundY && (x === padX || x === w - padX - 1)) continue;
+      buf[y * w + x] = 1;
+    }
+  }
+  return buf;
+}
+
+function encodeSixel(buf, w, h, palette) {
+  let out = '\x1bP0;1;0q';
+  out += '"1;1;' + w + ';' + h;
+  for (let i = 0; i < palette.length; i++) {
+    const [r, g, b] = palette[i];
+    out += '#' + (i + 1) + ';2;' + Math.round(r * 100 / 255) +
+           ';' + Math.round(g * 100 / 255) + ';' + Math.round(b * 100 / 255);
+  }
+  for (let bandY = 0; bandY < h; bandY += 6) {
+    const bandH = Math.min(6, h - bandY);
+    let bandHasData = false;
+    for (let ci = 1; ci <= palette.length; ci++) {
+      let row = '';
+      let runChar = '';
+      let runLen = 0;
+      for (let x = 0; x < w; x++) {
+        let bits = 0;
+        for (let dy = 0; dy < bandH; dy++) {
+          if (buf[(bandY + dy) * w + x] === ci) bits |= (1 << dy);
+        }
+        const ch = String.fromCharCode(63 + bits);
+        if (ch === runChar) { runLen++; }
+        else {
+          if (runLen > 0) {
+            if (runLen >= 4) row += '!' + runLen + runChar;
+            else row += runChar.repeat(runLen);
+          }
+          runChar = ch; runLen = 1;
+        }
+      }
+      if (runLen > 0) {
+        if (runLen >= 4) row += '!' + runLen + runChar;
+        else row += runChar.repeat(runLen);
+      }
+      if (row.replace(/[!0-9]/g, '').replace(/\?/g, '') === '') continue;
+      bandHasData = true;
+      out += '#' + ci + row + '$';
+    }
+    if (bandHasData && out.endsWith('$')) out = out.slice(0, -1);
+    out += '-';
+  }
+  if (out.endsWith('-')) out = out.slice(0, -1);
+  out += '\x1b\\';
+  return out;
+}
+
 function render() {
   const out = [];
   const w = termCols;
@@ -334,32 +438,7 @@ function render() {
   // Column widths (adaptive)
   const COL = computeColumns(w);
 
-  // Row 1: Title
-  const totalCount = portEntries.length;
-  const shownCount = filteredEntries.length;
-  const autoLabel = autoRefresh ? 'ON' : 'OFF';
-  out.push(pad(
-    ansi.fg.red + ansi.bold + ' Port Monitor' + ansi.reset +
-    ansi.dim + ' v1.0.0' + ansi.reset +
-    ansi.fg.white + `  [Total:${totalCount} Shown:${shownCount} Auto:${autoLabel}]` + ansi.reset,
-    w
-  ));
-
-  // Row 2: Filter bar
-  const stateLabel = STATES[stateFilterIdx];
-  const protoLabel = PROTOS[protoFilterIdx];
-  const searchLabel = searchQuery ? `"${truncate(searchQuery, 20)}"` : '""';
-  out.push(pad(
-    ansi.dim + ' State:' + ansi.reset + ansi.fg.yellow + stateLabel + ansi.reset +
-    ansi.dim + ' | Proto:' + ansi.reset + ansi.fg.yellow + protoLabel + ansi.reset +
-    ansi.dim + ' | Search:' + ansi.reset + ansi.fg.cyan + searchLabel + ansi.reset,
-    w
-  ));
-
-  // Row 3: Separator
-  out.push(pad(ansi.dim + ' ' + '\u2500'.repeat(Math.max(0, w - 2)) + ansi.reset, w));
-
-  // Row 4: Column headers
+  // Row 1: Column headers
   const sortIndicator = (col) => {
     if (sortColumn === col) return sortAsc ? ' \u25B2' : ' \u25BC';
     return '';
@@ -373,11 +452,28 @@ function render() {
   headerLine += ansi.bold + ansi.fg.white + 'PROCESS' + sortIndicator('process') + ansi.reset;
   out.push(pad(headerLine, w));
 
-  // Row 5: Separator
+  // Row 2: Separator
   out.push(pad(ansi.dim + ' ' + '\u2500'.repeat(Math.max(0, w - 2)) + ansi.reset, w));
 
-  // Row 6~N: Data rows
+  // Row 3~N: Data rows
   const dataRows = getDataRowCount();
+
+  // Loading indicator when no data yet
+  if (filteredEntries.length === 0 && collecting) {
+    const spinChars = ['\u280B', '\u2819', '\u2838', '\u2834', '\u2826', '\u2807'];
+    const spinIdx = Math.floor(Date.now() / 120) % spinChars.length;
+    const loadMsg = ansi.fg.yellow + ' ' + spinChars[spinIdx] + ' Loading...' + ansi.reset;
+    out.push(pad(loadMsg, w));
+    for (let i = 1; i < dataRows; i++) out.push(' '.repeat(w));
+
+    process.stdout.write(ansi.clear + ansi.hideCursor);
+    for (let i = 0; i < out.length; i++) {
+      process.stdout.write(ansi.moveTo(i + 1, 1) + out[i]);
+    }
+    scrollbarOverlay = null;
+    return;
+  }
+
   for (let i = 0; i < dataRows; i++) {
     const idx = scrollOffset + i;
     if (idx >= filteredEntries.length) {
@@ -388,35 +484,49 @@ function render() {
     const isSelected = idx === selectedIndex;
     const stateColor = getStateColor(entry.state);
 
-    let line = ' ';
-    line += pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1) + ansi.reset, COL.proto);
-    line += pad(ansi.fg.cyan + truncate(entry.localAddr, COL.local - 1) + ansi.reset, COL.local);
-    line += pad(ansi.dim + truncate(entry.remoteAddr, COL.remote - 1) + ansi.reset, COL.remote);
-    line += pad(stateColor + truncate(entry.state, COL.state - 1) + ansi.reset, COL.state);
-    line += pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1) + ansi.reset, COL.pid);
-    line += ansi.fg.magenta + truncate(entry.processName, Math.max(1, w - COL.proto - COL.local - COL.remote - COL.state - COL.pid - 2)) + ansi.reset;
-
+    const processMaxLen = Math.max(1, w - COL.proto - COL.local - COL.remote - COL.state - COL.pid - 2);
+    let line;
     if (isSelected) {
-      line = ansi.inverse + line + ansi.reset;
+      // No intermediate resets — inverse stays active across the entire line
+      line = ansi.inverse + ' ' +
+        pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1), COL.proto) +
+        pad(ansi.fg.cyan + truncate(entry.localAddr, COL.local - 1), COL.local) +
+        pad(ansi.fg.white + truncate(entry.remoteAddr, COL.remote - 1), COL.remote) +
+        pad(stateColor + truncate(entry.state, COL.state - 1), COL.state) +
+        pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1), COL.pid) +
+        ansi.fg.magenta + truncate(entry.processName, processMaxLen) +
+        ansi.reset;
+    } else {
+      line = ' ' +
+        pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1) + ansi.reset, COL.proto) +
+        pad(ansi.fg.cyan + truncate(entry.localAddr, COL.local - 1) + ansi.reset, COL.local) +
+        pad(ansi.dim + truncate(entry.remoteAddr, COL.remote - 1) + ansi.reset, COL.remote) +
+        pad(stateColor + truncate(entry.state, COL.state - 1) + ansi.reset, COL.state) +
+        pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1) + ansi.reset, COL.pid) +
+        ansi.fg.magenta + truncate(entry.processName, processMaxLen) + ansi.reset;
     }
     out.push(pad(line, w));
   }
-
-  // Status bar (last row)
-  const rangeStart = filteredEntries.length > 0 ? scrollOffset + 1 : 0;
-  const rangeEnd = Math.min(scrollOffset + dataRows, filteredEntries.length);
-  const statusLine =
-    ansi.bg.black + ansi.fg.white +
-    ` Updated:${lastUpdated || '--:--:--'}` +
-    ` | ${rangeStart}-${rangeEnd} of ${filteredEntries.length}` +
-    ` | [r]Refresh [/]Search [f]Filter [p]Proto [k]Kill [a]Auto` +
-    ansi.reset;
-  out.push(pad(statusLine, w));
 
   // Write output
   process.stdout.write(ansi.clear + ansi.hideCursor);
   for (let i = 0; i < out.length; i++) {
     process.stdout.write(ansi.moveTo(i + 1, 1) + out[i]);
+  }
+
+  // Sixel scrollbar overlay
+  scrollbarOverlay = null;
+  const maxScroll = getMaxScroll();
+  if (maxScroll > 0 && cellW > 0 && cellH > 0) {
+    const pixBuf = renderScrollbarPixels(cellW, cellH, dataRows, scrollOffset, maxScroll);
+    if (pixBuf) {
+      const palette = dragging === 'scrollbar' ? SCROLLBAR_ACTIVE_PALETTE : SCROLLBAR_PALETTE;
+      const sixelStr = encodeSixel(pixBuf, cellW, dataRows * cellH, palette);
+      const screenRow = 3;  // data area starts at row 3
+      const screenCol = w;  // rightmost column
+      scrollbarOverlay = { sixelStr, screenRow, screenCol, viewportRows: dataRows, maxScroll };
+      process.stdout.write(ansi.moveTo(screenRow, screenCol) + sixelStr);
+    }
   }
 }
 
@@ -438,18 +548,20 @@ function computeColumns(totalWidth) {
 let currentMenuZone = null;
 
 function getMenuZone(row) {
-  if (row === 1) return 'header';
-  if (row === 2) return 'header';
-  if (row === 4) return 'colheader';
-  if (row >= 6 && row <= 5 + getDataRowCount()) return 'data';
+  if (row === 1) return 'colheader';
+  if (row >= 3 && row <= 2 + getDataRowCount()) return 'data';
   return null;
 }
 
 function getMenuItems(zone) {
-  if (zone === 'header') {
+  if (zone === 'colheader') {
     return [
-      { id: 'refresh', label: 'Refresh', icon: 'refresh', shortcut: 'r' },
-      { id: 'auto_toggle', label: `Auto Refresh: ${autoRefresh ? 'ON' : 'OFF'}`, icon: 'sync', checked: autoRefresh },
+      { id: 'sort_proto',   label: 'Sort by Protocol' + (sortColumn === 'proto' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_local',   label: 'Sort by Local Address' + (sortColumn === 'local' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_remote',  label: 'Sort by Remote Address' + (sortColumn === 'remote' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_state',   label: 'Sort by State' + (sortColumn === 'state' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_pid',     label: 'Sort by PID' + (sortColumn === 'pid' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { id: 'sort_process', label: 'Sort by Process' + (sortColumn === 'process' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
       { type: 'separator' },
       { id: 'filter_state', label: 'State Filter', icon: 'filter', children:
         STATES.map(s => ({
@@ -465,19 +577,11 @@ function getMenuItems(zone) {
           checked: PROTOS[protoFilterIdx] === p,
         }))
       },
-      { type: 'separator' },
       { id: 'search', label: 'Search...', icon: 'search', shortcut: '/' },
       { id: 'clear_filters', label: 'Clear Filters', icon: 'clear-all' },
-    ];
-  }
-  if (zone === 'colheader') {
-    return [
-      { id: 'sort_proto',   label: 'Sort by Protocol' + (sortColumn === 'proto' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_local',   label: 'Sort by Local Address' + (sortColumn === 'local' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_remote',  label: 'Sort by Remote Address' + (sortColumn === 'remote' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_state',   label: 'Sort by State' + (sortColumn === 'state' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_pid',     label: 'Sort by PID' + (sortColumn === 'pid' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
-      { id: 'sort_process', label: 'Sort by Process' + (sortColumn === 'process' ? (sortAsc ? ' \u25B2' : ' \u25BC') : ''), icon: 'arrow-swap' },
+      { type: 'separator' },
+      { id: 'auto_toggle', label: `Auto Refresh: ${autoRefresh ? 'ON' : 'OFF'}`, icon: 'sync', checked: autoRefresh },
+      { id: 'refresh', label: 'Refresh', icon: 'refresh', shortcut: 'r' },
     ];
   }
   if (zone === 'data') {
@@ -560,7 +664,6 @@ async function handleMenuAction(actionId) {
   switch (actionId) {
     case 'refresh':
       collectPortData();
-      rerender();
       break;
     case 'auto_toggle':
       toggleAutoRefresh();
@@ -616,6 +719,8 @@ function handleInput(data) {
         if (json.method === 'resize' && json.params) {
           termCols = json.params.cols || termCols;
           termRows = json.params.rows || termRows;
+          if (json.params.cellWidth) cellW = Math.round(json.params.cellWidth);
+          if (json.params.cellHeight) cellH = Math.round(json.params.cellHeight);
           clampScroll();
           rerender();
         }
@@ -655,11 +760,55 @@ function handleInput(data) {
     // Update context menu zone
     updateMenuForZone(getMenuZone(cy));
 
-    // Left click on data row → select
-    if (pressed && !motion && !wheel && btn === 0) {
-      const dataStartRow = 6;
+    // Release → end drag
+    if (!pressed && !wheel) {
+      if (dragging === 'scrollbar') {
+        dragging = null;
+        scrollbarDragInfo = null;
+        rerender();
+      }
+      return;
+    }
+
+    // Scrollbar drag in progress (motion while dragging)
+    if (motion && dragging === 'scrollbar' && scrollbarDragInfo) {
+      const relY = cy - scrollbarDragInfo.trackTop;
+      const ratio = Math.max(0, Math.min(1, relY / Math.max(1, scrollbarDragInfo.trackH - 1)));
+      scrollOffset = Math.round(ratio * scrollbarDragInfo.maxScroll);
+      const dataRows = getDataRowCount();
+      if (selectedIndex < scrollOffset) selectedIndex = scrollOffset;
+      if (selectedIndex >= scrollOffset + dataRows) selectedIndex = scrollOffset + dataRows - 1;
+      if (selectedIndex >= filteredEntries.length) selectedIndex = filteredEntries.length - 1;
+      rerender();
+      return;
+    }
+
+    // Left click or Right click on data row → select
+    if (pressed && !motion && !wheel && (btn === 0 || btn === 2)) {
+      // Scrollbar click (left only)
+      if (btn === 0 && scrollbarOverlay && cx === scrollbarOverlay.screenCol &&
+          cy >= scrollbarOverlay.screenRow && cy < scrollbarOverlay.screenRow + scrollbarOverlay.viewportRows) {
+        dragging = 'scrollbar';
+        scrollbarDragInfo = {
+          trackTop: scrollbarOverlay.screenRow,
+          trackH: scrollbarOverlay.viewportRows,
+          maxScroll: scrollbarOverlay.maxScroll,
+        };
+        const relY = cy - scrollbarOverlay.screenRow;
+        const ratio = Math.max(0, Math.min(1, relY / Math.max(1, scrollbarOverlay.viewportRows - 1)));
+        scrollOffset = Math.round(ratio * scrollbarOverlay.maxScroll);
+        const dataRows = getDataRowCount();
+        if (selectedIndex < scrollOffset) selectedIndex = scrollOffset;
+        if (selectedIndex >= scrollOffset + dataRows) selectedIndex = scrollOffset + dataRows - 1;
+        if (selectedIndex >= filteredEntries.length) selectedIndex = filteredEntries.length - 1;
+        rerender();
+        return;
+      }
+
+      // Data row click → select
+      const dataStartRow = 3;
       const clickedDataIdx = cy - dataStartRow + scrollOffset;
-      if (cy >= dataStartRow && cy < dataStartRow + getDataRowCount() && clickedDataIdx < filteredEntries.length) {
+      if (cy >= dataStartRow && cy < dataStartRow + getDataRowCount() && clickedDataIdx >= 0 && clickedDataIdx < filteredEntries.length) {
         selectedIndex = clickedDataIdx;
         refreshContextMenu();
         rerender();
@@ -668,14 +817,18 @@ function handleInput(data) {
 
     // Scroll wheel
     if (wheel && pressed) {
+      const maxScroll = getMaxScroll();
+      const dataRows = getDataRowCount();
       if (btn === 0) {
-        // Wheel up
-        if (scrollOffset > 0) { scrollOffset--; clampScroll(); rerender(); }
+        scrollOffset = Math.max(0, scrollOffset - 3);
       } else {
-        // Wheel down
-        const maxScroll = Math.max(0, filteredEntries.length - getDataRowCount());
-        if (scrollOffset < maxScroll) { scrollOffset++; clampScroll(); rerender(); }
+        scrollOffset = Math.min(maxScroll, scrollOffset + 3);
       }
+      // Keep selectedIndex within visible range
+      if (selectedIndex < scrollOffset) selectedIndex = scrollOffset;
+      if (selectedIndex >= scrollOffset + dataRows) selectedIndex = scrollOffset + dataRows - 1;
+      if (selectedIndex >= filteredEntries.length) selectedIndex = filteredEntries.length - 1;
+      rerender();
     }
     return;
   }
@@ -763,7 +916,6 @@ function handleInput(data) {
     switch (ch) {
       case 'r': case 'R':
         collectPortData();
-        rerender();
         break;
       case '/':
         showSearchDialog();
@@ -840,10 +992,7 @@ function handleDialogResult(params) {
         });
       } catch { /* process may already be gone */ }
       // Refresh after kill
-      setTimeout(() => {
-        collectPortData();
-        rerender();
-      }, 500);
+      setTimeout(() => { collectPortData(); }, 500);
     }
   }
 }
@@ -910,7 +1059,6 @@ function startAutoRefresh() {
   stopAutoRefresh();
   autoRefreshTimer = setInterval(() => {
     collectPortData();
-    rerender();
   }, AUTO_REFRESH_INTERVAL);
 }
 
@@ -929,12 +1077,21 @@ function cleanup() {
   process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
 }
 
-function main() {
-  // Initial data collection
-  collectPortData();
-
-  // Initial render
+async function main() {
+  // Render immediately (empty data), then collect asynchronously
   render();
+
+  // Fetch cell size for sixel scrollbar
+  try {
+    const cellSizeResult = await sendRpc('get_cell_size');
+    if (cellSizeResult && cellSizeResult.cellWidth && cellSizeResult.cellHeight) {
+      cellW = Math.round(cellSizeResult.cellWidth);
+      cellH = Math.round(cellSizeResult.cellHeight);
+    }
+  } catch { /* use defaults */ }
+
+  // Collect data in background — rerender() called when done
+  collectPortData();
 
   // Start auto refresh
   if (autoRefresh) startAutoRefresh();
