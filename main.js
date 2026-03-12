@@ -55,8 +55,8 @@ const ansi = {
 // ============================================================
 // 2. State
 // ============================================================
-let termCols = parseInt((hecaton.get_env({ name: 'HECA_COLS' }) || {}).value || '120', 10);
-let termRows = parseInt((hecaton.get_env({ name: 'HECA_ROWS' }) || {}).value || '30', 10);
+let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '120', 10);
+let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '30', 10);
 let minimized = false;
 let rpcId = 1;
 const pendingRpc = new Map();
