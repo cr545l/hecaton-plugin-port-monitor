@@ -55,8 +55,8 @@ const ansi = {
 // ============================================================
 // 2. State
 // ============================================================
-let termCols = parseInt(process.env.HECA_COLS || '120', 10);
-let termRows = parseInt(process.env.HECA_ROWS || '30', 10);
+let termCols = parseInt((hecaton.get_env({ name: 'HECA_COLS' }) || {}).value || '120', 10);
+let termRows = parseInt((hecaton.get_env({ name: 'HECA_ROWS' }) || {}).value || '30', 10);
 let minimized = false;
 let rpcId = 1;
 const pendingRpc = new Map();
@@ -131,36 +131,29 @@ function handleRpcResponse(json) {
 // ============================================================
 // 4. Data Collection
 // ============================================================
-const { exec, execSync } = require('child_process');
-
-function execAsync(cmd, opts) {
-  return new Promise((resolve) => {
-    exec(cmd, opts, (err, stdout) => {
-      resolve(err ? '' : stdout);
-    });
-  });
-}
 
 async function refreshProcessCache() {
   const now = Date.now();
   if (now - processCacheTime < PROCESS_CACHE_TTL && processCache.size > 0) return;
   try {
-    const out = await execAsync('tasklist /FO CSV /NH', {
-      encoding: 'utf-8',
+    const result = await sendRpc('exec_process', {
+      program: 'tasklist',
+      args: ['/FO', 'CSV', '/NH'],
       timeout: 5000,
-      windowsHide: true,
     });
-    const newCache = new Map();
-    for (const line of out.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const match = trimmed.match(/^"([^"]+)","(\d+)"/);
-      if (match) {
-        newCache.set(match[2], match[1]);
+    if (result && result.ok && result.stdout) {
+      const newCache = new Map();
+      for (const line of result.stdout.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const match = trimmed.match(/^"([^"]+)","(\d+)"/);
+        if (match) {
+          newCache.set(match[2], match[1]);
+        }
       }
+      processCache = newCache;
+      processCacheTime = now;
     }
-    processCache = newCache;
-    processCacheTime = now;
   } catch {
     // keep old cache on error
   }
@@ -182,10 +175,11 @@ async function collectPortData() {
     rerender();
   }
   try {
-    const [netstatOut] = await Promise.all([
-      execAsync('netstat -ano', { encoding: 'utf-8', timeout: 10000, windowsHide: true }),
+    const [netstatResult] = await Promise.all([
+      sendRpc('exec_process', { program: 'netstat', args: ['-ano'], timeout: 10000 }),
       refreshProcessCache(),
     ]);
+    const netstatOut = (netstatResult && netstatResult.ok && netstatResult.stdout) ? netstatResult.stdout : '';
     const entries = [];
     for (const line of netstatOut.split('\n')) {
       const trimmed = line.trim();
@@ -1010,7 +1004,7 @@ async function showSearchDialog() {
   // result handled in dialog_result notification
 }
 
-function handleDialogResult(params) {
+async function handleDialogResult(params) {
   const { buttonId, value } = params;
 
   // Search dialog
@@ -1032,10 +1026,10 @@ function handleDialogResult(params) {
     const entry = filteredEntries[selectedIndex];
     if (entry && entry.pid && entry.pid !== '0' && entry.pid !== '4') {
       try {
-        execSync(`taskkill /PID ${entry.pid} /F`, {
-          encoding: 'utf-8',
+        await sendRpc('exec_process', {
+          program: 'taskkill',
+          args: ['/PID', entry.pid, '/F'],
           timeout: 5000,
-          windowsHide: true,
         });
       } catch { /* process may already be gone */ }
       // Refresh after kill
