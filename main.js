@@ -57,7 +57,7 @@ const ansi = {
 // ============================================================
 let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '120', 10);
 let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '30', 10);
-let minimized = false;
+let minimized = hecaton.initialState?.minimized ?? false;
 let rpcId = 1;
 const pendingRpc = new Map();
 
@@ -1119,7 +1119,7 @@ function cleanup() {
 
 async function main() {
   // Render immediately (empty data), then collect asynchronously
-  render();
+  rerender();
 
   // Fetch cell size for sixel scrollbar
   try {
