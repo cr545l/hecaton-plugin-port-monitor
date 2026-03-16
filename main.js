@@ -996,7 +996,7 @@ async function showSearchDialog() {
     message: 'Enter search query (matches proto, address, state, PID, process):',
     defaultValue: searchQuery,
     buttons: [
-      { id: 'ok', label: 'Search' },
+      { id: 'ok', label: 'Search', default: true },
       { id: 'clear', label: 'Clear' },
       { id: 'cancel', label: 'Cancel' },
     ],
@@ -1048,7 +1048,7 @@ async function killSelectedProcess() {
       type: 'message',
       title: 'Cannot Kill',
       message: `PID ${entry.pid} is a system process and cannot be terminated.`,
-      buttons: [{ id: 'ok', label: 'OK' }],
+      buttons: [{ id: 'ok', label: 'OK', default: true }],
     });
     return;
   }
@@ -1060,7 +1060,7 @@ async function killSelectedProcess() {
     message: `Terminate ${name} (PID ${entry.pid})?\n\nLocal: ${entry.localIp}:${entry.localPort}\nRemote: ${entry.remoteIp}:${entry.remotePort}\nState: ${entry.state || 'N/A'}`,
     buttons: [
       { id: 'kill_confirm', label: 'Kill' },
-      { id: 'cancel', label: 'Cancel' },
+      { id: 'cancel', label: 'Cancel', default: true },
     ],
   });
 }
