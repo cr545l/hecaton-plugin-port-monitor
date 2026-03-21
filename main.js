@@ -219,6 +219,7 @@ async function collectPortData() {
   }
   collecting = false;
   if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
+  updateTitle();
   rerender();
 }
 
@@ -280,6 +281,7 @@ function applyFilterAndSort() {
   });
 
   filteredEntries = entries;
+  updateTitle();
 
   // Clamp selection
   if (selectedIndex >= filteredEntries.length) {
@@ -315,8 +317,8 @@ function clampScroll() {
 }
 
 function getDataRowCount() {
-  // Rows: 1=colheader, 2=sep
-  return Math.max(1, termRows - 2);
+  // Rows: 1=colheader, 2=sep, last=statusbar
+  return Math.max(1, termRows - 3);
 }
 
 // ============================================================
@@ -452,15 +454,16 @@ function render() {
     if (sortColumn === col) return sortAsc ? ' \u25B2' : ' \u25BC';
     return '';
   };
+  const hdr = (label, col, colW) => colW > 0 ? pad(ansi.bold + ansi.fg.white + label + sortIndicator(col) + ansi.reset, colW) : '';
   let headerLine = ' ';
-  headerLine += pad(ansi.bold + ansi.fg.white + 'PROTO' + sortIndicator('proto') + ansi.reset, COL.proto);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'LOCAL IP' + sortIndicator('localIp') + ansi.reset, COL.localIp);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'PORT' + sortIndicator('localPort') + ansi.reset, COL.localPort);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'REMOTE IP' + sortIndicator('remoteIp') + ansi.reset, COL.remoteIp);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'PORT' + sortIndicator('remotePort') + ansi.reset, COL.remotePort);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'STATE' + sortIndicator('state') + ansi.reset, COL.state);
-  headerLine += pad(ansi.bold + ansi.fg.white + 'PID' + sortIndicator('pid') + ansi.reset, COL.pid);
-  headerLine += ansi.bold + ansi.fg.white + 'PROCESS' + sortIndicator('process') + ansi.reset;
+  headerLine += hdr('PROTO', 'proto', COL.proto);
+  headerLine += hdr('LOCAL IP', 'localIp', COL.localIp);
+  headerLine += hdr('PORT', 'localPort', COL.localPort);
+  headerLine += hdr('REMOTE IP', 'remoteIp', COL.remoteIp);
+  headerLine += hdr('PORT', 'remotePort', COL.remotePort);
+  headerLine += hdr('STATE', 'state', COL.state);
+  headerLine += hdr('PID', 'pid', COL.pid);
+  if (!COL.narrow) headerLine += ansi.bold + ansi.fg.white + 'PROCESS' + sortIndicator('process') + ansi.reset;
   out.push(pad(headerLine, w));
 
   // Row 2: Separator
@@ -476,6 +479,32 @@ function render() {
     const loadMsg = ansi.fg.yellow + ' ' + spinChars[spinIdx] + ' Loading...' + ansi.reset;
     out.push(pad(loadMsg, w));
     for (let i = 1; i < dataRows; i++) out.push(' '.repeat(w));
+    // Status bar
+    out.push(pad(renderStatusBar(w), w));
+
+    process.stdout.write(ansi.clear + ansi.hideCursor);
+    for (let i = 0; i < out.length; i++) {
+      process.stdout.write(ansi.moveTo(i + 1, 1) + out[i]);
+    }
+    scrollbarOverlay = null;
+    return;
+  }
+
+  // Empty state message when filter produces no results
+  if (filteredEntries.length === 0 && !collecting) {
+    const stateFilter = STATES[stateFilterIdx];
+    const protoFilter = PROTOS[protoFilterIdx];
+    let filterDesc = '';
+    if (stateFilter !== 'ALL') filterDesc += stateFilter;
+    if (protoFilter !== 'ALL') filterDesc += (filterDesc ? ', ' : '') + protoFilter;
+    if (searchQuery) filterDesc += (filterDesc ? ', ' : '') + '"' + searchQuery + '"';
+    const msg = filterDesc
+      ? ansi.fg.yellow + ' No matching entries' + ansi.dim + ' (filter: ' + filterDesc + ')' + ansi.reset
+      : ansi.fg.yellow + ' No port entries found' + ansi.reset;
+    out.push(pad(msg, w));
+    for (let i = 1; i < dataRows; i++) out.push(' '.repeat(w));
+    // Status bar
+    out.push(pad(renderStatusBar(w), w));
 
     process.stdout.write(ansi.clear + ansi.hideCursor);
     for (let i = 0; i < out.length; i++) {
@@ -496,31 +525,35 @@ function render() {
     const stateColor = getStateColor(entry.state);
 
     const processMaxLen = Math.max(1, w - COL.proto - COL.localIp - COL.localPort - COL.remoteIp - COL.remotePort - COL.state - COL.pid - 2);
+    const col = (text, color, colW) => colW > 0 ? pad(color + truncate(text, colW - 1) + (isSelected ? '' : ansi.reset), colW) : '';
     let line;
     if (isSelected) {
       line = ansi.inverse + ' ' +
-        pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1), COL.proto) +
-        pad(ansi.fg.cyan + truncate(entry.localIp, COL.localIp - 1), COL.localIp) +
-        pad(ansi.fg.cyan + truncate(entry.localPort, COL.localPort - 1), COL.localPort) +
-        pad(ansi.fg.white + truncate(entry.remoteIp, COL.remoteIp - 1), COL.remoteIp) +
-        pad(ansi.fg.white + truncate(entry.remotePort, COL.remotePort - 1), COL.remotePort) +
-        pad(stateColor + truncate(entry.state, COL.state - 1), COL.state) +
-        pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1), COL.pid) +
-        ansi.fg.magenta + truncate(entry.processName, processMaxLen) +
+        col(entry.proto, ansi.fg.white, COL.proto) +
+        col(entry.localIp, ansi.fg.cyan, COL.localIp) +
+        col(entry.localPort, ansi.fg.cyan, COL.localPort) +
+        col(entry.remoteIp, ansi.fg.white, COL.remoteIp) +
+        col(entry.remotePort, ansi.fg.white, COL.remotePort) +
+        col(entry.state, stateColor, COL.state) +
+        col(entry.pid, ansi.fg.yellow, COL.pid) +
+        (COL.narrow ? '' : ansi.fg.magenta + truncate(entry.processName, processMaxLen)) +
         ansi.reset;
     } else {
       line = ' ' +
-        pad(ansi.fg.white + truncate(entry.proto, COL.proto - 1) + ansi.reset, COL.proto) +
-        pad(ansi.fg.cyan + truncate(entry.localIp, COL.localIp - 1) + ansi.reset, COL.localIp) +
-        pad(ansi.fg.cyan + truncate(entry.localPort, COL.localPort - 1) + ansi.reset, COL.localPort) +
-        pad(ansi.dim + truncate(entry.remoteIp, COL.remoteIp - 1) + ansi.reset, COL.remoteIp) +
-        pad(ansi.dim + truncate(entry.remotePort, COL.remotePort - 1) + ansi.reset, COL.remotePort) +
-        pad(stateColor + truncate(entry.state, COL.state - 1) + ansi.reset, COL.state) +
-        pad(ansi.fg.yellow + truncate(entry.pid, COL.pid - 1) + ansi.reset, COL.pid) +
-        ansi.fg.magenta + truncate(entry.processName, processMaxLen) + ansi.reset;
+        col(entry.proto, ansi.fg.white, COL.proto) +
+        col(entry.localIp, ansi.fg.cyan, COL.localIp) +
+        col(entry.localPort, ansi.fg.cyan, COL.localPort) +
+        col(entry.remoteIp, ansi.dim, COL.remoteIp) +
+        col(entry.remotePort, ansi.dim, COL.remotePort) +
+        col(entry.state, stateColor, COL.state) +
+        col(entry.pid, ansi.fg.yellow, COL.pid) +
+        (COL.narrow ? '' : ansi.fg.magenta + truncate(entry.processName, processMaxLen) + ansi.reset);
     }
     out.push(pad(line, w));
   }
+
+  // Status bar (last row)
+  out.push(pad(renderStatusBar(w), w));
 
   // Write output
   process.stdout.write(ansi.clear + ansi.hideCursor);
@@ -545,6 +578,27 @@ function render() {
 }
 
 function computeColumns(totalWidth) {
+  if (totalWidth < 40) {
+    // Ultra-narrow: minimal columns
+    const proto = 5;
+    const localPort = 6;
+    const remaining = Math.max(0, totalWidth - proto - localPort - 2);
+    const localIp = remaining;
+    return { proto, localIp, localPort, remoteIp: 0, remotePort: 0, state: 0, pid: 0, narrow: true };
+  }
+  if (totalWidth < 60) {
+    // Narrow: skip remote port and process, compact others
+    const proto = 5;
+    const localPort = 7;
+    const remotePort = 0;
+    const pid = 7;
+    const state = 10;
+    const fixed = proto + localPort + pid + state + 2;
+    const remaining = Math.max(0, totalWidth - fixed);
+    const localIp = Math.max(8, Math.floor(remaining * 0.4));
+    const remoteIp = Math.max(8, remaining - localIp);
+    return { proto, localIp, localPort, remoteIp, remotePort, state, pid, narrow: false };
+  }
   const proto = 7;
   const localPort = 8;
   const remotePort = 8;
@@ -552,10 +606,45 @@ function computeColumns(totalWidth) {
   const state = 14;
   const fixed = proto + localPort + remotePort + pid + state + 2;
   const remaining = Math.max(0, totalWidth - fixed);
-  const localIp = Math.max(16, Math.floor(remaining * 0.25));
-  const remoteIp = Math.max(16, Math.floor(remaining * 0.25));
+  const localIp = Math.max(10, Math.floor(remaining * 0.25));
+  const remoteIp = Math.max(10, Math.floor(remaining * 0.25));
   // process gets the rest
-  return { proto, localIp, localPort, remoteIp, remotePort, state, pid };
+  return { proto, localIp, localPort, remoteIp, remotePort, state, pid, narrow: false };
+}
+
+function renderStatusBar(w) {
+  const stateFilter = STATES[stateFilterIdx];
+  const protoFilter = PROTOS[protoFilterIdx];
+  const parts = [];
+  if (w < 30) {
+    parts.push(ansi.dim + ' ' + filteredEntries.length + ansi.reset);
+    if (stateFilter !== 'ALL') parts.push(ansi.fg.cyan + truncate(stateFilter, 6) + ansi.reset);
+    if (protoFilter !== 'ALL') parts.push(ansi.fg.cyan + protoFilter + ansi.reset);
+  } else {
+    parts.push(ansi.dim + ' ' + filteredEntries.length + '/' + portEntries.length + ' entries' + ansi.reset);
+    if (stateFilter !== 'ALL') parts.push(ansi.fg.cyan + stateFilter + ansi.reset);
+    if (protoFilter !== 'ALL') parts.push(ansi.fg.cyan + protoFilter + ansi.reset);
+    if (searchQuery) parts.push(ansi.fg.yellow + '\u2315 ' + truncate(searchQuery, 15) + ansi.reset);
+    const arStr = autoRefresh
+      ? ansi.fg.green + 'AR' + ansi.reset
+      : ansi.dim + 'AR' + ansi.reset;
+    parts.push(arStr);
+    if (lastUpdated && w >= 50) parts.push(ansi.dim + lastUpdated + ansi.reset);
+  }
+  return truncate(parts.join(ansi.dim + ' \u2502 ' + ansi.reset), w);
+}
+
+function updateTitle() {
+  const stateFilter = STATES[stateFilterIdx];
+  const protoFilter = PROTOS[protoFilterIdx];
+  let title = 'Port Monitor';
+  const filters = [];
+  if (stateFilter !== 'ALL') filters.push(stateFilter);
+  if (protoFilter !== 'ALL') filters.push(protoFilter);
+  if (searchQuery) filters.push('"' + searchQuery + '"');
+  if (filters.length) title += ' [' + filters.join(', ') + ']';
+  title += ' (' + filteredEntries.length + ')';
+  sendRpc('set_title', { title });
 }
 
 function getColumnAtX(cx) {
@@ -586,18 +675,19 @@ function toggleSort(col) {
     sortAsc = true;
   }
   applyFilterAndSort();
-  refreshContextMenu();
+
   rerender();
 }
 
 // ============================================================
 // 7. Context Menu
 // ============================================================
-let currentMenuZone = null;
-
 function getMenuZone(row) {
   if (row === 1) return 'colheader';
-  if (row >= 3 && row <= 2 + getDataRowCount()) return 'data';
+  if (row >= 3 && row <= 2 + getDataRowCount()) {
+    const dataIdx = row - 3 + scrollOffset;
+    if (dataIdx < filteredEntries.length) return 'data';
+  }
   return null;
 }
 
@@ -655,20 +745,6 @@ function getMenuItems(zone) {
 }
 
 
-function updateMenuForZone(zone) {
-  if (zone === currentMenuZone) return;
-  currentMenuZone = zone;
-  const items = zone ? getMenuItems(zone) : [];
-  sendRpc('register_context_menu', { items });
-}
-
-function refreshContextMenu() {
-  // Force re-register current zone menu
-  const zone = currentMenuZone;
-  currentMenuZone = null;
-  updateMenuForZone(zone);
-}
-
 async function handleMenuAction(actionId) {
   // State filter actions
   if (actionId.startsWith('state_')) {
@@ -676,7 +752,6 @@ async function handleMenuAction(actionId) {
     stateFilterIdx = STATES.indexOf(state);
     if (stateFilterIdx < 0) stateFilterIdx = 0;
     applyFilterAndSort();
-    refreshContextMenu();
     rerender();
     return;
   }
@@ -686,7 +761,6 @@ async function handleMenuAction(actionId) {
     protoFilterIdx = PROTOS.indexOf(proto);
     if (protoFilterIdx < 0) protoFilterIdx = 0;
     applyFilterAndSort();
-    refreshContextMenu();
     rerender();
     return;
   }
@@ -711,7 +785,7 @@ async function handleMenuAction(actionId) {
       protoFilterIdx = 0;
       searchQuery = '';
       applyFilterAndSort();
-      refreshContextMenu();
+    
       rerender();
       break;
     case 'kill':
@@ -770,6 +844,11 @@ function handleInput(data) {
         if (json.method === 'maximize') {
           rerender();
         }
+        if (json.method === 'context_menu_request' && json.params) {
+          const zone = getMenuZone(json.params.row);
+          const items = zone ? getMenuItems(zone) : [];
+          if (items.length) sendRpc('show_context_menu', { items });
+        }
         if (json.method === 'context_menu_action' && json.params) {
           handleMenuAction(json.params.id);
         }
@@ -791,9 +870,6 @@ function handleInput(data) {
     const btn = cb & 3;
     const motion = !!(cb & 32);
     const wheel = !!(cb & 64);
-
-    // Update context menu zone
-    updateMenuForZone(getMenuZone(cy));
 
     // Release → end drag
     if (!pressed && !wheel) {
@@ -851,7 +927,7 @@ function handleInput(data) {
       const clickedDataIdx = cy - dataStartRow + scrollOffset;
       if (cy >= dataStartRow && cy < dataStartRow + getDataRowCount() && clickedDataIdx >= 0 && clickedDataIdx < filteredEntries.length) {
         selectedIndex = clickedDataIdx;
-        refreshContextMenu();
+      
         rerender();
       }
     }
@@ -891,7 +967,7 @@ function handleInput(data) {
           if (selectedIndex > 0) {
             selectedIndex--;
             clampScroll();
-            refreshContextMenu();
+          
             rerender();
           }
           break;
@@ -899,20 +975,20 @@ function handleInput(data) {
           if (selectedIndex < filteredEntries.length - 1) {
             selectedIndex++;
             clampScroll();
-            refreshContextMenu();
+          
             rerender();
           }
           break;
         case 'H': // Home
           selectedIndex = 0;
           scrollOffset = 0;
-          refreshContextMenu();
+        
           rerender();
           break;
         case 'F': // End
           selectedIndex = Math.max(0, filteredEntries.length - 1);
           clampScroll();
-          refreshContextMenu();
+        
           rerender();
           break;
       }
@@ -924,7 +1000,7 @@ function handleInput(data) {
         const pageSize = getDataRowCount();
         selectedIndex = Math.max(0, selectedIndex - pageSize);
         clampScroll();
-        refreshContextMenu();
+      
         rerender();
         return;
       }
@@ -932,7 +1008,7 @@ function handleInput(data) {
         const pageSize = getDataRowCount();
         selectedIndex = Math.min(filteredEntries.length - 1, selectedIndex + pageSize);
         clampScroll();
-        refreshContextMenu();
+      
         rerender();
         return;
       }
@@ -964,13 +1040,13 @@ function handleInput(data) {
       case 'f': case 'F':
         stateFilterIdx = (stateFilterIdx + 1) % STATES.length;
         applyFilterAndSort();
-        refreshContextMenu();
+      
         rerender();
         break;
       case 'p':
         protoFilterIdx = (protoFilterIdx + 1) % PROTOS.length;
         applyFilterAndSort();
-        refreshContextMenu();
+      
         rerender();
         break;
       case 'k': case 'K':
@@ -1091,7 +1167,7 @@ function toggleAutoRefresh() {
   } else {
     stopAutoRefresh();
   }
-  refreshContextMenu();
+
   rerender();
 }
 
