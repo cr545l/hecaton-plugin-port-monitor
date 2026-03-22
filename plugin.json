@@ -3,7 +3,6 @@
   "name": "Port Monitor",
   "version": "1.0.0",
   "entry": "main.js",
-  "runtime": "node",
   "apiVersion": { "major": 1, "minor": 0 },
   "overlay": {
     "mode": "floating",
