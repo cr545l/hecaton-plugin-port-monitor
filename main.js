@@ -58,8 +58,7 @@ const ansi = {
 let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '120', 10);
 let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '30', 10);
 let minimized = hecaton.initialState?.minimized ?? false;
-let rpcId = 1;
-const pendingRpc = new Map();
+// (rpcId and pendingRpc removed — using hecaton.* wrapper)
 
 // Port data
 let portEntries = [];      // raw parsed entries
@@ -106,26 +105,7 @@ let scrollbarDragInfo = null; // { trackTop, trackH, maxScroll }
 // 3. RPC Helpers
 // ============================================================
 function sendRpc(method, params = {}) {
-  const id = rpcId++;
-  const msg = JSON.stringify({ jsonrpc: '2.0', method, params, id });
-  process.stderr.write('__HECA_RPC__' + msg + '\n');
-  return new Promise((resolve) => {
-    pendingRpc.set(id, resolve);
-    setTimeout(() => {
-      if (pendingRpc.has(id)) {
-        pendingRpc.delete(id);
-        resolve(null);
-      }
-    }, 5000);
-  });
-}
-
-function handleRpcResponse(json) {
-  if (json.id != null && pendingRpc.has(json.id)) {
-    const resolve = pendingRpc.get(json.id);
-    pendingRpc.delete(json.id);
-    resolve(json.result || null);
-  }
+  return hecaton[method](params).then(r => r || null).catch(() => null);
 }
 
 // ============================================================
@@ -820,7 +800,6 @@ function handleInput(data) {
 
         // RPC response
         if (json.id != null && (json.result || json.error)) {
-          handleRpcResponse(json);
           continue;
         }
 
