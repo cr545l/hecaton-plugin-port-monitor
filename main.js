@@ -786,58 +786,39 @@ async function handleMenuAction(actionId) {
 // ============================================================
 // 8. Input Handling
 // ============================================================
+hecaton.on('resize', (params) => {
+  termCols = params.cols || termCols;
+  termRows = params.rows || termRows;
+  if (params.cellWidth) cellW = Math.round(params.cellWidth);
+  if (params.cellHeight) cellH = Math.round(params.cellHeight);
+  clampScroll();
+  rerender();
+});
+hecaton.on('minimize', () => {
+  minimized = true;
+  rerender();
+});
+hecaton.on('restore', () => {
+  minimized = false;
+  rerender();
+});
+hecaton.on('maximize', () => {
+  rerender();
+});
+hecaton.on('context_menu_request', (params) => {
+  const zone = getMenuZone(params.row);
+  const items = zone ? getMenuItems(zone) : [];
+  if (items.length) sendRpc('show_context_menu', { items });
+});
+hecaton.on('context_menu_action', (params) => {
+  handleMenuAction(params.id);
+});
+hecaton.on('dialog_result', (params) => {
+  handleDialogResult(params);
+});
+
 function handleInput(data) {
   const str = data.toString();
-
-  // Host RPC messages
-  if (str.indexOf('__HECA_RPC__') !== -1) {
-    const segments = str.split('__HECA_RPC__');
-    for (const seg of segments) {
-      const trimmed = seg.trim();
-      if (!trimmed) continue;
-      try {
-        const json = JSON.parse(trimmed);
-
-        // RPC response
-        if (json.id != null && (json.result || json.error)) {
-          continue;
-        }
-
-        // Host notifications
-        if (json.method === 'resize' && json.params) {
-          termCols = json.params.cols || termCols;
-          termRows = json.params.rows || termRows;
-          if (json.params.cellWidth) cellW = Math.round(json.params.cellWidth);
-          if (json.params.cellHeight) cellH = Math.round(json.params.cellHeight);
-          clampScroll();
-          rerender();
-        }
-        if (json.method === 'minimize') {
-          minimized = true;
-          rerender();
-        }
-        if (json.method === 'restore') {
-          minimized = false;
-          rerender();
-        }
-        if (json.method === 'maximize') {
-          rerender();
-        }
-        if (json.method === 'context_menu_request' && json.params) {
-          const zone = getMenuZone(json.params.row);
-          const items = zone ? getMenuItems(zone) : [];
-          if (items.length) sendRpc('show_context_menu', { items });
-        }
-        if (json.method === 'context_menu_action' && json.params) {
-          handleMenuAction(json.params.id);
-        }
-        if (json.method === 'dialog_result' && json.params) {
-          handleDialogResult(json.params);
-        }
-      } catch { /* ignore parse errors */ }
-    }
-    return;
-  }
 
   // SGR mouse events: ESC[<Cb;Cx;CyM (press) or ESC[<Cb;Cx;Cym (release)
   const mouseMatch = str.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
