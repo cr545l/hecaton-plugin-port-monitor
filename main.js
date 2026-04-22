@@ -55,8 +55,8 @@ const ansi = {
 // ============================================================
 // 2. State
 // ============================================================
-let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '120', 10);
-let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '30', 10);
+let termCols = parseInt((await hecaton.env.get({ name: 'HECA_COLS' })).value || '120', 10);
+let termRows = parseInt((await hecaton.env.get({ name: 'HECA_ROWS' })).value || '30', 10);
 let minimized = hecaton.initialState?.minimized ?? false;
 // (rpcId and pendingRpc removed — using hecaton.* wrapper)
 
@@ -105,7 +105,17 @@ let scrollbarDragInfo = null; // { trackTop, trackH, maxScroll }
 // 3. RPC Helpers
 // ============================================================
 function sendRpc(method, params = {}) {
-  return hecaton[method](params).then(r => r || null).catch(() => null);
+  // Resolve dotted namespace path (e.g. "window.set_title") or flat name.
+  const parts = method.split('.');
+  let fn = hecaton;
+  for (const p of parts) {
+    if (fn == null) break;
+    fn = fn[p];
+  }
+  if (typeof fn !== 'function') {
+    return Promise.resolve(null);
+  }
+  return fn(params).then(r => r || null).catch(() => null);
 }
 
 // ============================================================
@@ -116,10 +126,10 @@ async function refreshProcessCache() {
   const now = Date.now();
   if (now - processCacheTime < PROCESS_CACHE_TTL && processCache.size > 0) return;
   try {
-    const result = await sendRpc('exec_process', {
+    const result = await sendRpc('process.exec', {
       program: 'tasklist',
       args: ['/FO', 'CSV', '/NH'],
-      timeout: 5000,
+      timeout_ms: 5000,
     });
     if (result && result.ok && result.stdout) {
       const newCache = new Map();
@@ -156,7 +166,7 @@ async function collectPortData() {
   }
   try {
     const [netstatResult] = await Promise.all([
-      sendRpc('exec_process', { program: 'netstat', args: ['-ano'], timeout: 10000 }),
+      sendRpc('process.exec', { program: 'netstat', args: ['-ano'], timeout_ms: 10000 }),
       refreshProcessCache(),
     ]);
     const netstatOut = (netstatResult && netstatResult.ok && netstatResult.stdout) ? netstatResult.stdout : '';
@@ -624,7 +634,7 @@ function updateTitle() {
   if (searchQuery) filters.push('"' + searchQuery + '"');
   if (filters.length) title += ' [' + filters.join(', ') + ']';
   title += ' (' + filteredEntries.length + ')';
-  sendRpc('set_title', { title });
+  sendRpc('window.set_title', { title });
 }
 
 function getColumnAtX(cx) {
@@ -786,34 +796,34 @@ async function handleMenuAction(actionId) {
 // ============================================================
 // 8. Input Handling
 // ============================================================
-hecaton.on('resize', (params) => {
+hecaton.on('window_resized', (params) => {
   termCols = params.cols || termCols;
   termRows = params.rows || termRows;
-  if (params.cellWidth) cellW = Math.round(params.cellWidth);
-  if (params.cellHeight) cellH = Math.round(params.cellHeight);
+  if (params.cell_width) cellW = Math.round(params.cell_width);
+  if (params.cell_height) cellH = Math.round(params.cell_height);
   clampScroll();
   rerender();
 });
-hecaton.on('minimize', () => {
+hecaton.on('window_minimized', () => {
   minimized = true;
   rerender();
 });
-hecaton.on('restore', () => {
+hecaton.on('window_restored', () => {
   minimized = false;
   rerender();
 });
-hecaton.on('maximize', () => {
+hecaton.on('window_maximized', () => {
   rerender();
 });
-hecaton.on('context_menu_request', (params) => {
+hecaton.on('menu_requested', (params) => {
   const zone = getMenuZone(params.row);
   const items = zone ? getMenuItems(zone) : [];
-  if (items.length) sendRpc('show_context_menu', { items });
+  if (items.length) sendRpc('menu.show', { items });
 });
-hecaton.on('context_menu_action', (params) => {
+hecaton.on('menu_activated', (params) => {
   handleMenuAction(params.id);
 });
-hecaton.on('dialog_result', (params) => {
+hecaton.on('dialog_resolved', (params) => {
   handleDialogResult(params);
 });
 
@@ -1026,7 +1036,7 @@ function handleInput(data) {
 // 9. Actions
 // ============================================================
 async function showSearchDialog() {
-  const result = await sendRpc('show_dialog', {
+  const result = await sendRpc('dialog.show', {
     type: 'input',
     title: 'Search Ports',
     message: 'Enter search query (matches proto, address, state, PID, process):',
@@ -1037,20 +1047,20 @@ async function showSearchDialog() {
       { id: 'cancel', label: 'Cancel' },
     ],
   });
-  // result handled in dialog_result notification
+  // result handled in dialog_resolved notification
 }
 
 async function handleDialogResult(params) {
-  const { buttonId, value } = params;
+  const { button_id, value } = params;
 
   // Search dialog
-  if (buttonId === 'ok' && value != null) {
+  if (button_id === 'ok' && value != null) {
     searchQuery = value;
     applyFilterAndSort();
     rerender();
     return;
   }
-  if (buttonId === 'clear') {
+  if (button_id === 'clear') {
     searchQuery = '';
     applyFilterAndSort();
     rerender();
@@ -1058,14 +1068,14 @@ async function handleDialogResult(params) {
   }
 
   // Kill confirmation
-  if (buttonId === 'kill_confirm') {
+  if (button_id === 'kill_confirm') {
     const entry = filteredEntries[selectedIndex];
     if (entry && entry.pid && entry.pid !== '0' && entry.pid !== '4') {
       try {
-        await sendRpc('exec_process', {
+        await sendRpc('process.exec', {
           program: 'taskkill',
           args: ['/PID', entry.pid, '/F'],
-          timeout: 5000,
+          timeout_ms: 5000,
         });
       } catch { /* process may already be gone */ }
       // Refresh after kill
@@ -1080,7 +1090,7 @@ async function killSelectedProcess() {
 
   // Protect system processes
   if (entry.pid === '0' || entry.pid === '4') {
-    await sendRpc('show_dialog', {
+    await sendRpc('dialog.show', {
       type: 'message',
       title: 'Cannot Kill',
       message: `PID ${entry.pid} is a system process and cannot be terminated.`,
@@ -1090,7 +1100,7 @@ async function killSelectedProcess() {
   }
 
   const name = entry.processName || 'Unknown';
-  await sendRpc('show_dialog', {
+  await sendRpc('dialog.show', {
     type: 'message',
     title: 'Kill Process',
     message: `Terminate ${name} (PID ${entry.pid})?\n\nLocal: ${entry.localIp}:${entry.localPort}\nRemote: ${entry.remoteIp}:${entry.remotePort}\nState: ${entry.state || 'N/A'}`,
@@ -1105,19 +1115,19 @@ async function copySelectedLine() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
   const line = `${entry.proto}\t${entry.localIp}\t${entry.localPort}\t${entry.remoteIp}\t${entry.remotePort}\t${entry.state}\t${entry.pid}\t${entry.processName}`;
-  await sendRpc('write_clipboard', { text: line });
+  await sendRpc('clipboard.write', { text: line });
 }
 
 async function copySelectedPort() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  await sendRpc('write_clipboard', { text: entry.localPort });
+  await sendRpc('clipboard.write', { text: entry.localPort });
 }
 
 async function copySelectedAddr() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  await sendRpc('write_clipboard', { text: entry.localIp + ':' + entry.localPort });
+  await sendRpc('clipboard.write', { text: entry.localIp + ':' + entry.localPort });
 }
 
 function toggleAutoRefresh() {
@@ -1159,10 +1169,10 @@ async function main() {
 
   // Fetch cell size for sixel scrollbar
   try {
-    const cellSizeResult = await sendRpc('get_cell_size');
-    if (cellSizeResult && cellSizeResult.cellWidth && cellSizeResult.cellHeight) {
-      cellW = Math.round(cellSizeResult.cellWidth);
-      cellH = Math.round(cellSizeResult.cellHeight);
+    const cellSizeResult = await sendRpc('window.get_cell_size');
+    if (cellSizeResult && cellSizeResult.cell_width && cellSizeResult.cell_height) {
+      cellW = Math.round(cellSizeResult.cell_width);
+      cellH = Math.round(cellSizeResult.cell_height);
     }
   } catch { /* use defaults */ }
 
