@@ -3,7 +3,7 @@
   "name": "Port Monitor",
   "version": "1.0.0",
   "entry": "main.js",
-  "apiVersion": { "major": 1, "minor": 1 },
+  "apiVersion": "1.1",
   "overlay": {
     "mode": "floating",
     "width": "80%",
