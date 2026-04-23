@@ -102,35 +102,18 @@ let dragging = null;          // 'scrollbar' | null
 let scrollbarDragInfo = null; // { trackTop, trackH, maxScroll }
 
 // ============================================================
-// 3. RPC Helpers
-// ============================================================
-function sendRpc(method, params = {}) {
-  // Resolve dotted namespace path (e.g. "window.set_title") or flat name.
-  const parts = method.split('.');
-  let fn = hecaton;
-  for (const p of parts) {
-    if (fn == null) break;
-    fn = fn[p];
-  }
-  if (typeof fn !== 'function') {
-    return Promise.resolve(null);
-  }
-  return fn(params).then(r => r || null).catch(() => null);
-}
-
-// ============================================================
-// 4. Data Collection
+// 3. Data Collection
 // ============================================================
 
 async function refreshProcessCache() {
   const now = Date.now();
   if (now - processCacheTime < PROCESS_CACHE_TTL && processCache.size > 0) return;
   try {
-    const result = await sendRpc('process.exec', {
+    const result = await hecaton.process.exec({
       program: 'tasklist',
       args: ['/FO', 'CSV', '/NH'],
       timeout_ms: 5000,
-    });
+    }).catch(() => null);
     if (result && result.ok && result.stdout) {
       const newCache = new Map();
       for (const line of result.stdout.split('\n')) {
@@ -166,7 +149,7 @@ async function collectPortData() {
   }
   try {
     const [netstatResult] = await Promise.all([
-      sendRpc('process.exec', { program: 'netstat', args: ['-ano'], timeout_ms: 10000 }),
+      hecaton.process.exec({ program: 'netstat', args: ['-ano'], timeout_ms: 10000 }).catch(() => null),
       refreshProcessCache(),
     ]);
     const netstatOut = (netstatResult && netstatResult.ok && netstatResult.stdout) ? netstatResult.stdout : '';
@@ -331,7 +314,7 @@ function renderMinimized() {
     else if (e.state === 'ESTABLISHED') estCount++;
   }
   const text = `TCP:${tcpCount} UDP:${udpCount} | LISTEN:${listenCount} EST:${estCount}`;
-  sendRpc('set_minimized_label', { label: text });
+  hecaton.window.set_minimized_label({ label: text }).catch(() => null);
 }
 
 function getStateColor(state) {
@@ -634,7 +617,7 @@ function updateTitle() {
   if (searchQuery) filters.push('"' + searchQuery + '"');
   if (filters.length) title += ' [' + filters.join(', ') + ']';
   title += ' (' + filteredEntries.length + ')';
-  sendRpc('window.set_title', { title });
+  hecaton.window.set_title({ title }).catch(() => null);
 }
 
 function getColumnAtX(cx) {
@@ -818,7 +801,7 @@ hecaton.on('window_maximized', () => {
 hecaton.on('menu_requested', (params) => {
   const zone = getMenuZone(params.row);
   const items = zone ? getMenuItems(zone) : [];
-  if (items.length) sendRpc('menu.show', { items });
+  if (items.length) hecaton.menu.show({ items }).catch(() => null);
 });
 hecaton.on('menu_activated', (params) => {
   handleMenuAction(params.id);
@@ -1036,7 +1019,7 @@ function handleInput(data) {
 // 9. Actions
 // ============================================================
 async function showSearchDialog() {
-  const result = await sendRpc('dialog.show', {
+  const result = await hecaton.dialog.show({
     type: 'input',
     title: 'Search Ports',
     message: 'Enter search query (matches proto, address, state, PID, process):',
@@ -1046,7 +1029,7 @@ async function showSearchDialog() {
       { id: 'clear', label: 'Clear' },
       { id: 'cancel', label: 'Cancel' },
     ],
-  });
+  }).catch(() => null);
   // result handled in dialog_resolved notification
 }
 
@@ -1072,11 +1055,11 @@ async function handleDialogResult(params) {
     const entry = filteredEntries[selectedIndex];
     if (entry && entry.pid && entry.pid !== '0' && entry.pid !== '4') {
       try {
-        await sendRpc('process.exec', {
+        await hecaton.process.exec({
           program: 'taskkill',
           args: ['/PID', entry.pid, '/F'],
           timeout_ms: 5000,
-        });
+        }).catch(() => null);
       } catch { /* process may already be gone */ }
       // Refresh after kill
       setTimeout(() => { collectPortData(); }, 500);
@@ -1090,17 +1073,17 @@ async function killSelectedProcess() {
 
   // Protect system processes
   if (entry.pid === '0' || entry.pid === '4') {
-    await sendRpc('dialog.show', {
+    await hecaton.dialog.show({
       type: 'message',
       title: 'Cannot Kill',
       message: `PID ${entry.pid} is a system process and cannot be terminated.`,
       buttons: [{ id: 'ok', label: 'OK', default: true }],
-    });
+    }).catch(() => null);
     return;
   }
 
   const name = entry.processName || 'Unknown';
-  await sendRpc('dialog.show', {
+  await hecaton.dialog.show({
     type: 'message',
     title: 'Kill Process',
     message: `Terminate ${name} (PID ${entry.pid})?\n\nLocal: ${entry.localIp}:${entry.localPort}\nRemote: ${entry.remoteIp}:${entry.remotePort}\nState: ${entry.state || 'N/A'}`,
@@ -1108,26 +1091,26 @@ async function killSelectedProcess() {
       { id: 'kill_confirm', label: 'Kill' },
       { id: 'cancel', label: 'Cancel', default: true },
     ],
-  });
+  }).catch(() => null);
 }
 
 async function copySelectedLine() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
   const line = `${entry.proto}\t${entry.localIp}\t${entry.localPort}\t${entry.remoteIp}\t${entry.remotePort}\t${entry.state}\t${entry.pid}\t${entry.processName}`;
-  await sendRpc('clipboard.write', { text: line });
+  await hecaton.clipboard.write({ text: line }).catch(() => null);
 }
 
 async function copySelectedPort() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  await sendRpc('clipboard.write', { text: entry.localPort });
+  await hecaton.clipboard.write({ text: entry.localPort }).catch(() => null);
 }
 
 async function copySelectedAddr() {
   const entry = filteredEntries[selectedIndex];
   if (!entry) return;
-  await sendRpc('clipboard.write', { text: entry.localIp + ':' + entry.localPort });
+  await hecaton.clipboard.write({ text: entry.localIp + ':' + entry.localPort }).catch(() => null);
 }
 
 function toggleAutoRefresh() {
@@ -1169,7 +1152,7 @@ async function main() {
 
   // Fetch cell size for sixel scrollbar
   try {
-    const cellSizeResult = await sendRpc('window.get_cell_size');
+    const cellSizeResult = await hecaton.window.get_cell_size().catch(() => null);
     if (cellSizeResult && cellSizeResult.cell_width && cellSizeResult.cell_height) {
       cellW = Math.round(cellSizeResult.cell_width);
       cellH = Math.round(cellSizeResult.cell_height);
