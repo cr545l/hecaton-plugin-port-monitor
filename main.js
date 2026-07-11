@@ -14,7 +14,9 @@
  *   /         - Search (input dialog)
  *   f         - Cycle state filter
  *   p         - Cycle protocol filter
- *   k         - Kill selected process
+ *   k         - Kill selected process (tree kill; escalates to force kill
+ *               of orphaned children if the port stays occupied — netstat
+ *               may report a dead parent PID while children hold the socket)
  *   a         - Toggle auto refresh
  *   c         - Copy selected line
  *   ESC       - Close (handled by host)
@@ -100,6 +102,13 @@ let cellH = 16;
 let scrollbarOverlay = null;  // { sixelStr, screenRow, screenCol, viewportRows, maxScroll }
 let dragging = null;          // 'scrollbar' | null
 let scrollbarDragInfo = null; // { trackTop, trackH, maxScroll }
+
+// Kill flow state
+// Entries are captured when the dialog is shown — selection can shift under
+// auto-refresh while a dialog is open, so never re-read filteredEntries on resolve.
+let pendingKillEntry = null;  // entry for kill_confirm
+let pendingForceKill = null;  // { entry, targets: [{pid, name}] } for force_kill_confirm
+let killInProgress = false;
 
 // ============================================================
 // 3. Data Collection
@@ -1050,20 +1059,173 @@ async function handleDialogResult(params) {
     return;
   }
 
-  // Kill confirmation
+  // Kill confirmation (uses the entry captured when the dialog was shown)
   if (button_id === 'kill_confirm') {
-    const entry = filteredEntries[selectedIndex];
+    const entry = pendingKillEntry;
+    pendingKillEntry = null;
     if (entry && entry.pid && entry.pid !== '0' && entry.pid !== '4') {
-      try {
-        await hecaton.process.exec({
-          program: 'taskkill',
-          args: ['/PID', entry.pid, '/F'],
-          timeout_ms: 5000,
-        }).catch(() => null);
-      } catch { /* process may already be gone */ }
-      // Refresh after kill
-      setTimeout(() => { collectPortData(); }, 500);
+      executeKill(entry);
     }
+    return;
+  }
+
+  // Force-kill confirmation (orphaned children / actual socket owners)
+  if (button_id === 'force_kill_confirm') {
+    const fk = pendingForceKill;
+    pendingForceKill = null;
+    if (fk) executeForceKill(fk);
+    return;
+  }
+
+  if (button_id === 'cancel') {
+    pendingKillEntry = null;
+    pendingForceKill = null;
+  }
+}
+
+// ---- Kill helpers ----
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function taskkillTree(pid) {
+  const result = await hecaton.process.exec({
+    program: 'taskkill',
+    args: ['/PID', pid, '/T', '/F'],
+    timeout_ms: 8000,
+  }).catch(() => null);
+  return !!(result && result.ok);
+}
+
+// Re-scan netstat for PIDs currently bound to proto:localPort (system PIDs excluded).
+// May include stale PIDs: netstat reports the socket's creator, which can be a
+// process that already exited while children inherited the handle.
+async function findPortOwners(proto, localPort) {
+  const pids = new Set();
+  const result = await hecaton.process.exec({ program: 'netstat', args: ['-ano'], timeout_ms: 10000 }).catch(() => null);
+  if (!result || !result.ok || !result.stdout) return pids;
+  for (const line of result.stdout.split('\n')) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4 || parts[0].toUpperCase() !== proto) continue;
+    const [, port] = splitAddr(parts[1]);
+    if (port !== localPort) continue;
+    let pid = proto === 'UDP' ? (parts[3] || parts[2]) : (parts[4] || '');
+    if (proto === 'UDP' && /^\d+$/.test(parts[2])) pid = parts[2];
+    if (/^\d+$/.test(pid) && pid !== '0' && pid !== '4') pids.add(pid);
+  }
+  return pids;
+}
+
+// Full process list with parent PIDs, for tracking down orphaned children.
+async function getProcessSnapshot() {
+  const result = await hecaton.process.exec({
+    program: 'powershell',
+    args: ['-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Csv -NoTypeInformation'],
+    timeout_ms: 15000,
+  }).catch(() => null);
+  const procs = [];
+  if (result && result.ok && result.stdout) {
+    for (const line of result.stdout.split('\n')) {
+      const m = line.trim().match(/^"(\d+)","(\d+)","(.*)"$/);
+      if (m) procs.push({ pid: m[1], ppid: m[2], name: m[3] });
+    }
+  }
+  return procs;
+}
+
+// Descendants of rootPid, including orphans whose parent already exited
+// (Windows keeps the stale ParentProcessId on the child).
+function findDescendants(rootPid, procs) {
+  const byParent = new Map();
+  for (const p of procs) {
+    if (!byParent.has(p.ppid)) byParent.set(p.ppid, []);
+    byParent.get(p.ppid).push(p);
+  }
+  const result = [];
+  const seen = new Set([rootPid]);
+  const queue = [rootPid];
+  while (queue.length) {
+    for (const child of byParent.get(queue.shift()) || []) {
+      if (seen.has(child.pid)) continue;
+      seen.add(child.pid);
+      result.push(child);
+      queue.push(child.pid);
+    }
+  }
+  return result;
+}
+
+// Tree-kill the entry's PID, then verify the port was actually freed.
+// If not (dead-parent PID in netstat, orphaned children holding the socket),
+// locate the real holders and ask for a force kill.
+async function executeKill(entry) {
+  if (killInProgress) return;
+  killInProgress = true;
+  try {
+    await taskkillTree(entry.pid);
+    await sleep(500);
+    const owners = await findPortOwners(entry.proto, entry.localPort);
+    if (owners.size === 0) return;
+
+    const procs = await getProcessSnapshot();
+    const nameByPid = new Map(procs.map((p) => [p.pid, p.name]));
+    const targets = new Map(); // pid -> name
+    for (const opid of [entry.pid, ...owners]) {
+      // Owner PID still alive → it is the real holder
+      if (opid !== entry.pid && nameByPid.has(opid)) targets.set(opid, nameByPid.get(opid));
+      // Dead or alive, sweep its descendants — orphans inherit the socket handle
+      for (const d of findDescendants(opid, procs)) targets.set(d.pid, d.name);
+    }
+    targets.delete('0');
+    targets.delete('4');
+    targets.delete(String(process.pid));
+
+    if (targets.size === 0) {
+      await hecaton.dialog.show({
+        type: 'message',
+        title: 'Kill Incomplete',
+        message: `Port ${entry.localPort} is still in use, but no killable owner was found.\nnetstat may be reporting a stale PID; try refreshing.`,
+        buttons: [{ id: 'ok', label: 'OK', default: true }],
+      }).catch(() => null);
+      return;
+    }
+
+    pendingForceKill = { entry, targets: [...targets].map(([pid, name]) => ({ pid, name })) };
+    const list = pendingForceKill.targets.map((t) => `  ${t.name || '(unknown)'} (PID ${t.pid})`).join('\n');
+    await hecaton.dialog.show({
+      type: 'message',
+      title: 'Force Kill',
+      message: `Port ${entry.localPort} is still in use after killing PID ${entry.pid}.\nThe socket appears to be held by orphaned children or another owner:\n\n${list}\n\nForce kill ${pendingForceKill.targets.length} process(es)?`,
+      buttons: [
+        { id: 'force_kill_confirm', label: 'Force Kill' },
+        { id: 'cancel', label: 'Cancel', default: true },
+      ],
+    }).catch(() => null);
+  } finally {
+    killInProgress = false;
+    setTimeout(() => { collectPortData(); }, 300);
+  }
+}
+
+async function executeForceKill(fk) {
+  if (killInProgress) return;
+  killInProgress = true;
+  try {
+    for (const t of fk.targets) {
+      await taskkillTree(t.pid);
+    }
+    await sleep(500);
+    const owners = await findPortOwners(fk.entry.proto, fk.entry.localPort);
+    if (owners.size > 0) {
+      await hecaton.dialog.show({
+        type: 'message',
+        title: 'Force Kill Incomplete',
+        message: `Port ${fk.entry.localPort} is still in use by PID(s): ${[...owners].join(', ')}.\nThe process may be protected or running elevated.`,
+        buttons: [{ id: 'ok', label: 'OK', default: true }],
+      }).catch(() => null);
+    }
+  } finally {
+    killInProgress = false;
+    setTimeout(() => { collectPortData(); }, 300);
   }
 }
 
@@ -1083,10 +1245,11 @@ async function killSelectedProcess() {
   }
 
   const name = entry.processName || 'Unknown';
+  pendingKillEntry = entry;
   await hecaton.dialog.show({
     type: 'message',
     title: 'Kill Process',
-    message: `Terminate ${name} (PID ${entry.pid})?\n\nLocal: ${entry.localIp}:${entry.localPort}\nRemote: ${entry.remoteIp}:${entry.remotePort}\nState: ${entry.state || 'N/A'}`,
+    message: `Terminate ${name} (PID ${entry.pid}) and its process tree?\n\nLocal: ${entry.localIp}:${entry.localPort}\nRemote: ${entry.remoteIp}:${entry.remotePort}\nState: ${entry.state || 'N/A'}`,
     buttons: [
       { id: 'kill_confirm', label: 'Kill' },
       { id: 'cancel', label: 'Cancel', default: true },
