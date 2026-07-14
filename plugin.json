@@ -1,7 +1,7 @@
 {
-  "id": "port-monitor",
+  "id": "dev.hecaton.port-monitor",
   "name": "Port Monitor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "entry": "main.js",
   "apiVersion": "1.1",
   "overlay": {
