@@ -3,7 +3,7 @@
 /**
  * Port Monitor - Hecaton Plugin
  *
- * Monitors active network ports using netstat and provides
+ * Monitors active network ports using platform-specific tools and provides
  * process management through context menus.
  *
  * Keyboard:
@@ -91,6 +91,8 @@ const PROCESS_CACHE_TTL = 10000;
 
 // Data collection state
 let collecting = false;
+let collectionError = '';
+const platform = await detectPlatform();
 let lastUpdated = '';
 let loadingTimer = null;
 
@@ -113,6 +115,53 @@ let killInProgress = false;
 // ============================================================
 // 3. Data Collection
 // ============================================================
+
+async function detectPlatform() {
+  if (typeof process.platform === 'string') return process.platform;
+  const os = await hecaton.env.get({ name: 'OS' }).catch(() => null);
+  if (os?.value === 'Windows_NT') return 'win32';
+  const result = await hecaton.process.exec({ program: '/usr/bin/uname', args: ['-s'], timeout_ms: 5000 });
+  if (result.ok && result.stdout.trim() === 'Darwin') return 'darwin';
+  throw new Error('Unsupported operating system');
+}
+
+// lsof field output preserves process names containing spaces and IPv6 addresses.
+function parseLsof(output) {
+  const entries = [];
+  let pid = '', processName = '', socket = null;
+  const flush = () => {
+    if (!socket || !socket.address || !['TCP', 'UDP'].includes(socket.proto)) return;
+    const [local, remote] = socket.address.split('->');
+    const [localIp, localPort] = splitAddr(local);
+    const [remoteIp, remotePort] = splitAddr(remote || '*:*');
+    const state = socket.state === 'LISTEN' ? 'LISTENING' : (socket.state || '');
+    entries.push({ proto: socket.proto, localIp, localPort, remoteIp, remotePort, state, pid, processName });
+  };
+  for (const line of output.split('\n')) {
+    const value = line.slice(1);
+    switch (line[0]) {
+      case 'p': flush(); socket = null; pid = value; processName = ''; break;
+      case 'c': processName = value; break;
+      case 'f': flush(); socket = {}; break;
+      case 'P': if (socket) socket.proto = value; break;
+      case 'n': if (socket) socket.address = value; break;
+      case 'T': if (socket && value.startsWith('ST=')) socket.state = value.slice(3); break;
+    }
+  }
+  flush();
+  return entries;
+}
+
+async function collectMacPorts() {
+  const result = await hecaton.process.exec({
+    program: '/usr/sbin/lsof', args: ['-nP', '-iTCP', '-iUDP', '-FpcPfnT'], timeout_ms: 10000,
+  });
+  // lsof exits 1 with no output when no sockets match.
+  if (!result || (!result.ok && !(result.exit_code === 1 && !result.stdout && !result.stderr))) {
+    throw new Error('lsof failed; check command availability and permissions');
+  }
+  return parseLsof(result.stdout || '');
+}
 
 async function refreshProcessCache() {
   const now = Date.now();
@@ -157,47 +206,56 @@ async function collectPortData() {
     rerender();
   }
   try {
-    const [netstatResult] = await Promise.all([
-      hecaton.process.exec({ program: 'netstat', args: ['-ano'], timeout_ms: 10000 }).catch(() => null),
-      refreshProcessCache(),
-    ]);
-    const netstatOut = (netstatResult && netstatResult.ok && netstatResult.stdout) ? netstatResult.stdout : '';
-    const entries = [];
-    for (const line of netstatOut.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const parts = trimmed.split(/\s+/);
-      if (parts.length < 4) continue;
-      const proto = parts[0].toUpperCase();
-      if (proto !== 'TCP' && proto !== 'UDP') continue;
+    let entries = [];
+    if (platform === 'darwin') {
+      entries = await collectMacPorts();
+    } else if (platform === 'win32') {
+      const [netstatResult] = await Promise.all([
+        hecaton.process.exec({ program: 'netstat', args: ['-ano'], timeout_ms: 10000 }).catch(() => null),
+        refreshProcessCache(),
+      ]);
+      if (!netstatResult?.ok) throw new Error('netstat failed');
+      const netstatOut = netstatResult.stdout || '';
+      for (const line of netstatOut.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const parts = trimmed.split(/\s+/);
+        if (parts.length < 4) continue;
+        const proto = parts[0].toUpperCase();
+        if (proto !== 'TCP' && proto !== 'UDP') continue;
 
-      let localAddr, remoteAddr, state, pid;
-      if (proto === 'UDP') {
-        localAddr = parts[1];
-        remoteAddr = parts[2] || '*:*';
-        state = '';
-        pid = parts[3] || parts[2];
-        if (/^\d+$/.test(remoteAddr)) {
-          pid = remoteAddr;
-          remoteAddr = '*:*';
+        let localAddr, remoteAddr, state, pid;
+        if (proto === 'UDP') {
+          localAddr = parts[1];
+          remoteAddr = parts[2] || '*:*';
+          state = '';
+          pid = parts[3] || parts[2];
+          if (/^\d+$/.test(remoteAddr)) {
+            pid = remoteAddr;
+            remoteAddr = '*:*';
+          }
+        } else {
+          localAddr = parts[1];
+          remoteAddr = parts[2];
+          state = parts[3] || '';
+          pid = parts[4] || '';
         }
-      } else {
-        localAddr = parts[1];
-        remoteAddr = parts[2];
-        state = parts[3] || '';
-        pid = parts[4] || '';
-      }
 
-      const processName = processCache.get(pid) || '';
-      const [localIp, localPort] = splitAddr(localAddr);
-      const [remoteIp, remotePort] = splitAddr(remoteAddr);
-      entries.push({ proto, localIp, localPort, remoteIp, remotePort, state, pid, processName });
+        const processName = processCache.get(pid) || '';
+        const [localIp, localPort] = splitAddr(localAddr);
+        const [remoteIp, remotePort] = splitAddr(remoteAddr);
+        entries.push({ proto, localIp, localPort, remoteIp, remotePort, state, pid, processName });
+      }
+    } else {
+      throw new Error('Unsupported operating system: ' + platform);
     }
+    collectionError = '';
     portEntries = entries;
     lastUpdated = new Date().toLocaleTimeString('en-US', { hour12: false });
     applyFilterAndSort();
-  } catch {
-    // keep old data on error
+  } catch (error) {
+    collectionError = error.message || 'Port collection failed';
+    // Keep the previous successful snapshot on failure.
   }
   collecting = false;
   if (loadingTimer) { clearInterval(loadingTimer); loadingTimer = null; }
@@ -480,7 +538,9 @@ function render() {
     if (stateFilter !== 'ALL') filterDesc += stateFilter;
     if (protoFilter !== 'ALL') filterDesc += (filterDesc ? ', ' : '') + protoFilter;
     if (searchQuery) filterDesc += (filterDesc ? ', ' : '') + '"' + searchQuery + '"';
-    const msg = filterDesc
+    const msg = collectionError
+      ? ansi.fg.red + ' ' + truncate(collectionError, Math.max(1, w - 2)) + ansi.reset
+      : filterDesc
       ? ansi.fg.yellow + ' No matching entries' + ansi.dim + ' (filter: ' + filterDesc + ')' + ansi.reset
       : ansi.fg.yellow + ' No port entries found' + ansi.reset;
     out.push(pad(msg, w));
@@ -595,6 +655,7 @@ function computeColumns(totalWidth) {
 }
 
 function renderStatusBar(w) {
+  if (collectionError) return ansi.fg.red + truncate(' ' + collectionError, w) + ansi.reset;
   const stateFilter = STATES[stateFilterIdx];
   const protoFilter = PROTOS[protoFilterIdx];
   const parts = [];
@@ -1063,7 +1124,7 @@ async function handleDialogResult(params) {
   if (button_id === 'kill_confirm') {
     const entry = pendingKillEntry;
     pendingKillEntry = null;
-    if (entry && entry.pid && entry.pid !== '0' && entry.pid !== '4') {
+    if (entry && canKillPid(entry.pid)) {
       executeKill(entry);
     }
     return;
@@ -1086,7 +1147,25 @@ async function handleDialogResult(params) {
 // ---- Kill helpers ----
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function taskkillTree(pid) {
+function canKillPid(pid) {
+  return /^\d+$/.test(pid) && Number(pid) > 0 && pid !== String(process.pid)
+    && pid !== (platform === 'win32' ? '4' : '1');
+}
+
+async function taskkillTree(pid, force = false) {
+  if (!canKillPid(pid)) return false;
+  if (platform === 'darwin') {
+    const procs = await getProcessSnapshot();
+    const targets = [...findDescendants(pid, procs).reverse().map(p => p.pid), pid];
+    let ok = true;
+    for (const target of targets.filter(canKillPid)) {
+      const result = await hecaton.process.exec({
+        program: '/bin/kill', args: [force ? '-KILL' : '-TERM', target], timeout_ms: 5000,
+      }).catch(() => null);
+      if (!result?.ok) ok = false;
+    }
+    return ok;
+  }
   const result = await hecaton.process.exec({
     program: 'taskkill',
     args: ['/PID', pid, '/T', '/F'],
@@ -1100,6 +1179,12 @@ async function taskkillTree(pid) {
 // process that already exited while children inherited the handle.
 async function findPortOwners(proto, localPort) {
   const pids = new Set();
+  if (platform === 'darwin') {
+    for (const entry of await collectMacPorts()) {
+      if (entry.proto === proto && entry.localPort === localPort && canKillPid(entry.pid)) pids.add(entry.pid);
+    }
+    return pids;
+  }
   const result = await hecaton.process.exec({ program: 'netstat', args: ['-ano'], timeout_ms: 10000 }).catch(() => null);
   if (!result || !result.ok || !result.stdout) return pids;
   for (const line of result.stdout.split('\n')) {
@@ -1116,6 +1201,16 @@ async function findPortOwners(proto, localPort) {
 
 // Full process list with parent PIDs, for tracking down orphaned children.
 async function getProcessSnapshot() {
+  if (platform === 'darwin') {
+    const result = await hecaton.process.exec({
+      program: '/bin/ps', args: ['-axo', 'pid=,ppid=,comm='], timeout_ms: 5000,
+    });
+    if (!result?.ok) throw new Error('ps failed; cannot inspect process tree');
+    return (result.stdout || '').split('\n').flatMap(line => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      return match ? [{ pid: match[1], ppid: match[2], name: match[3].split('/').pop() }] : [];
+    });
+  }
   const result = await hecaton.process.exec({
     program: 'powershell',
     args: ['-NoProfile', '-NonInteractive', '-Command',
@@ -1171,19 +1266,17 @@ async function executeKill(entry) {
     const targets = new Map(); // pid -> name
     for (const opid of [entry.pid, ...owners]) {
       // Owner PID still alive → it is the real holder
-      if (opid !== entry.pid && nameByPid.has(opid)) targets.set(opid, nameByPid.get(opid));
+      if ((platform === 'darwin' || opid !== entry.pid) && nameByPid.has(opid)) targets.set(opid, nameByPid.get(opid));
       // Dead or alive, sweep its descendants — orphans inherit the socket handle
       for (const d of findDescendants(opid, procs)) targets.set(d.pid, d.name);
     }
-    targets.delete('0');
-    targets.delete('4');
-    targets.delete(String(process.pid));
+    for (const pid of targets.keys()) if (!canKillPid(pid)) targets.delete(pid);
 
     if (targets.size === 0) {
       await hecaton.dialog.show({
         type: 'message',
         title: 'Kill Incomplete',
-        message: `Port ${entry.localPort} is still in use, but no killable owner was found.\nnetstat may be reporting a stale PID; try refreshing.`,
+        message: `Port ${entry.localPort} is still in use, but no killable owner was found.\nThe process may be protected or the PID stale; try refreshing.`,
         buttons: [{ id: 'ok', label: 'OK', default: true }],
       }).catch(() => null);
       return;
@@ -1200,6 +1293,11 @@ async function executeKill(entry) {
         { id: 'cancel', label: 'Cancel', default: true },
       ],
     }).catch(() => null);
+  } catch (error) {
+    await hecaton.dialog.show({
+      type: 'message', title: 'Kill Failed', message: error.message || 'Could not verify port owners',
+      buttons: [{ id: 'ok', label: 'OK', default: true }],
+    }).catch(() => null);
   } finally {
     killInProgress = false;
     setTimeout(() => { collectPortData(); }, 300);
@@ -1211,7 +1309,7 @@ async function executeForceKill(fk) {
   killInProgress = true;
   try {
     for (const t of fk.targets) {
-      await taskkillTree(t.pid);
+      await taskkillTree(t.pid, true);
     }
     await sleep(500);
     const owners = await findPortOwners(fk.entry.proto, fk.entry.localPort);
@@ -1223,6 +1321,11 @@ async function executeForceKill(fk) {
         buttons: [{ id: 'ok', label: 'OK', default: true }],
       }).catch(() => null);
     }
+  } catch (error) {
+    await hecaton.dialog.show({
+      type: 'message', title: 'Kill Failed', message: error.message || 'Could not verify port owners',
+      buttons: [{ id: 'ok', label: 'OK', default: true }],
+    }).catch(() => null);
   } finally {
     killInProgress = false;
     setTimeout(() => { collectPortData(); }, 300);
@@ -1234,7 +1337,7 @@ async function killSelectedProcess() {
   if (!entry) return;
 
   // Protect system processes
-  if (entry.pid === '0' || entry.pid === '4') {
+  if (!canKillPid(entry.pid)) {
     await hecaton.dialog.show({
       type: 'message',
       title: 'Cannot Kill',
